@@ -80,8 +80,8 @@ far_field = True                 # fracPy propagatorType 'Fraunhofer'
 # fracPy fixed dxo = dxp = 1.76e-8; that is exactly the far-field sampling below.
 pixel_size_m = wavelength_m * det_dist_m / (n_dp * det_pixel_m)
 
-n_probe_modes = 3                # fracPy reconstruction.npsm
-n_opr_modes = 1                  # variable probe (OPR); 1 disables it
+n_probe_modes = 5                # fracPy reconstruction.npsm
+n_opr_modes = 3                  # variable probe (OPR); 1 disables it
 probe_diameter_m = 1.0e-6        # only used when no probe comes from init_recon_file
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
@@ -417,8 +417,8 @@ recon_probe = task.get_data_to_cpu("probe", as_numpy=True)[0]
 recon_pos = task.get_data_to_cpu("probe_positions", as_numpy=True)
 loss_table = task.reconstructor.loss_tracker.table
 
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-axes[0].imshow(np.angle(recon_obj), cmap="gray")
+fig, axes = plt.subplots(1, 3, figsize=(15, 7))
+axes[0].imshow(np.angle(recon_obj[380:480, 480:580]), cmap="gray")
 axes[0].set_title("object phase")
 axes[1].imshow(np.abs(recon_obj), cmap="gray")
 axes[1].set_title("object magnitude")

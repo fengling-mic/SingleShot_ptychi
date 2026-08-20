@@ -1,1 +1,5 @@
-pty-chi/
+__pycache__/
+*.py[cod]
+
+# Reconstruction outputs
+recon_out/
