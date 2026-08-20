@@ -22,6 +22,9 @@
 #   params.momentumAcceleration    -> reconstructor_options.momentum_acceleration_gain
 #   params.positionCorrectionSwitch-> probe_position_options.optimizable
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # This makes GPU N appear as GPU 0 to CuPy
+
 import logging
 from pathlib import Path
 
@@ -86,17 +89,17 @@ probe_diameter_m = 1.0e-6        # only used when no probe comes from init_recon
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
 num_epochs = 500
-batch_size = 200
+batch_size = 200                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
-noise_model = api.NoiseModels.GAUSSIAN
-momentum_gain = 0.5              # fracPy params.momentumAcceleration
+noise_model = api.NoiseModels.POISSON
+momentum_gain = 0.25              # fracPy params.momentumAcceleration
 
 probe_start = 1                  # epoch at which the probe starts updating
-opr_start = 20                   # None disables OPR weight optimization
-position_start = 50              # None disables position correction (fracPy pcPIE)
-orthogonalization_stride = 10    # fracPy params.orthogonalizationFrequency
-position_update_limit_px = 2.0
-optimize_intensity_variation = True   # per-position beam intensity ("ic")
+opr_start = 10                   # None disables OPR weight optimization
+position_start = 10              # None disables position correction (fracPy pcPIE)
+orthogonalization_stride = 5    # fracPy params.orthogonalizationFrequency
+position_update_limit_px = 20.0
+optimize_intensity_variation = False   # per-position beam intensity ("ic")
 
 # fracPy flip switches
 flip_dp_x = False
