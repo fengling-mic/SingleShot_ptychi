@@ -3,3 +3,9 @@ __pycache__/
 
 # Reconstruction outputs
 recon_out/
+
+# Local Python environment
+ptychi-env/
+
+# Local login/session log
+.loglogin

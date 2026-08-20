@@ -49,7 +49,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 scan = "S0206"
 scan_initialGuess = "S0206"  # scan used to generate the initial guess (positions + probe)
-data_root = Path(r"\\micdata\data2\12IDC\2026_Data\2026_2\01_ptycho")
+data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_2/01_ptycho")
 
 dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.hdf5"
 para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
