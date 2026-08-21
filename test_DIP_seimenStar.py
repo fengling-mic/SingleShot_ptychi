@@ -119,6 +119,21 @@ dip_model_params = {
     "base_channels": 32,
     "use_batchnorm": True,
 }
+
+# DIP feeds the generator a fixed random tensor z and learns x = G(theta; z). Pty-Chi
+# hardcodes z ~ U(0, 0.1) in DIPPlanarObject.get_nn_input() and only ever re-rolls it via
+# reconstructor_options.random_seed, so these knobs override it after the task is built.
+# Set dip_input_seed = None to leave Pty-Chi's own draw alone.
+#
+# Note this is the ONLY random initialization that affects a DIP run. The `obj` buffer
+# below supplies the object *shape* only: with residual_generation=False the network
+# overwrites the object tensor at the start of every forward pass
+# (forward_models.py:525 -> generate() -> self.tensor.data = o), so randomizing `obj`
+# itself would have no effect.
+dip_input_seed = 0               # re-roll z alone, leaving all other draws fixed
+dip_input_scale = 0.1            # Pty-Chi default
+dip_input_dist = "uniform"       # "uniform" | "normal"
+
 object_step_size = 1e-5          # learning rate on CNN weights, not on pixels
 probe_step_size = 0.1
 # OPR weights default to step_size=1, which is an LSQML-era value: there the update is
@@ -479,6 +494,25 @@ task = PtychographyTask(
     probe_position_x_px=positions_px[:, 1],
     opr_mode_weights_data=opr_weights,
 )
+
+# Override the DIP generator input z (see the dip_input_* knobs above). nn_input is a
+# registered buffer on the DIPPlanarObject, so reassigning it is enough; draw on the CPU
+# with an explicit generator so the result is reproducible independently of device and of
+# whatever else has consumed the global RNG by this point.
+if dip_input_seed is not None:
+    _buf = task.object.nn_input
+    _g = torch.Generator(device="cpu").manual_seed(dip_input_seed)
+    if dip_input_dist == "normal":
+        _z = torch.randn(_buf.shape, generator=_g) * dip_input_scale
+    elif dip_input_dist == "uniform":
+        _z = torch.rand(_buf.shape, generator=_g) * dip_input_scale
+    else:
+        raise ValueError(f"dip_input_dist must be 'uniform' or 'normal', got {dip_input_dist!r}")
+    task.object.nn_input = _z.to(device=_buf.device, dtype=_buf.dtype)
+    print(
+        f"DIP input z: {dip_input_dist}, scale {dip_input_scale}, seed {dip_input_seed}, "
+        f"{tuple(_z.shape)} on {_buf.device}"
+    )
 
 
 #%% ---------------------------------------------------------------- run
