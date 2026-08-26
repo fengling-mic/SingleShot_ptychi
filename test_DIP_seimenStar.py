@@ -84,15 +84,30 @@ far_field = True                 # fracPy propagatorType 'Fraunhofer'
 # fracPy fixed dxo = dxp = 1.76e-8; that is exactly the far-field sampling below.
 pixel_size_m = wavelength_m * det_dist_m / (n_dp * det_pixel_m)
 
-n_probe_modes = 5                # fracPy reconstruction.npsm
-n_opr_modes = 3                  # variable probe (OPR); 1 disables it
+n_probe_modes = 3                # fracPy reconstruction.npsm
+n_opr_modes = 1                  # variable probe (OPR); 1 disables it
 probe_diameter_m = 1.0e-6        # only used when no probe comes from init_recon_file
 object_padding_px = 100          # extra object buffer around the scan bounding box
+
+# Initial object guess. "gaussian" draws amplitude ~ N(amp_mean, amp_std) and phase
+# ~ N(0, phase_std) rad, independently per pixel.
+#
+# NOTE: with deep_image_prior_options.residual_generation = False (the default, and what
+# this script uses) these values are DISCARDED. The network overwrites the object tensor
+# at the start of every forward pass -- forward_models.py:525 dip_generate() ->
+# generate() -> self.tensor.data = o -- so `obj` supplies only the shape. Set
+# residual_generation = True (with zero_conv in dip_model_params) to make this the base
+# the network adds a learned correction to; then the init below actually matters.
+object_init = "gaussian"         # "ones" | "gaussian"
+object_init_amp_mean = 1.0       # transmission ~1 for a thin sample
+object_init_amp_std = 0.1
+object_init_phase_std = 0.1      # radians
+object_init_seed = 0
 
 # Backprop through the CNN over the whole object every step is far more expensive per
 # epoch than LSQML's closed-form update. Start small, check the per-epoch wall time in
 # the log, then raise.
-num_epochs = 50
+num_epochs = 500
 batch_size = 200                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
 # MSE on sqrt(intensity), i.e. on amplitudes. Do NOT use LossFunctions.POISSON here:
@@ -119,30 +134,8 @@ dip_model_params = {
     "base_channels": 32,
     "use_batchnorm": True,
 }
-
-# DIP feeds the generator a fixed random tensor z and learns x = G(theta; z). Pty-Chi
-# hardcodes z ~ U(0, 0.1) in DIPPlanarObject.get_nn_input() and only ever re-rolls it via
-# reconstructor_options.random_seed, so these knobs override it after the task is built.
-# Set dip_input_seed = None to leave Pty-Chi's own draw alone.
-#
-# Note this is the ONLY random initialization that affects a DIP run. The `obj` buffer
-# below supplies the object *shape* only: with residual_generation=False the network
-# overwrites the object tensor at the start of every forward pass
-# (forward_models.py:525 -> generate() -> self.tensor.data = o), so randomizing `obj`
-# itself would have no effect.
-dip_input_seed = 0               # re-roll z alone, leaving all other draws fixed
-dip_input_scale = 0.1            # Pty-Chi default
-dip_input_dist = "uniform"       # "uniform" | "normal"
-
-object_step_size = 1e-5          # learning rate on CNN weights, not on pixels
+object_step_size = 1e-6          # learning rate on CNN weights, not on pixels
 probe_step_size = 0.1
-# OPR weights default to step_size=1, which is an LSQML-era value: there the update is
-# analytically scaled, here it multiplies a raw autodiff gradient summed over
-# n_dp^2 * batch_size pixels. At 1 the weights explode within ~3 epochs of opr_start and
-# the run dies in the SVD orthogonalization with "input tensor should not contain
-# infs or NaNs". Measured on S0206: 1e-2 still diverges (~epoch 17), 1e-4 is stable
-# through 50 epochs.
-opr_step_size = 1e-4
 
 # fracPy flip switches
 flip_dp_x = False
@@ -360,7 +353,26 @@ plt.show()
 #%% ---------------------------------------------------------------- initial object
 
 object_shape = get_suggested_object_size(positions_px, probe.shape[-2:], extra=object_padding_px)
-obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
+
+if object_init == "ones":
+    obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
+elif object_init == "gaussian":
+    # Draw on the CPU with an explicit generator so the pattern is reproducible
+    # independently of device and of whatever else has consumed the global RNG.
+    _g = torch.Generator(device="cpu").manual_seed(object_init_seed)
+    _amp = object_init_amp_mean + object_init_amp_std * torch.randn(
+        (1, *object_shape), generator=_g
+    )
+    _amp.clamp_(min=0.0)  # a magnitude cannot be negative
+    _ph = object_init_phase_std * torch.randn((1, *object_shape), generator=_g)
+    obj = torch.polar(_amp, _ph).to(get_default_complex_dtype())  # (n_slices, h, w)
+    print(
+        f"initial object: gaussian seed {object_init_seed}, "
+        f"|obj| mean {_amp.mean():.4f} std {_amp.std():.4f}, "
+        f"phase std {_ph.std():.4f} rad"
+    )
+else:
+    raise ValueError(f"object_init must be 'ones' or 'gaussian', got {object_init!r}")
 
 # fracPy 0726 started flat; the 0728 variant pasted the prior object in. Uncomment to do that.
 # if "object" in prior:
@@ -374,6 +386,15 @@ obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_sl
 
 print(f"object buffer: {tuple(obj.shape)}")
 
+fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+axes[0].imshow(np.abs(obj[0].numpy()))
+axes[0].set_title("initial object magnitude")
+axes[1].imshow(np.angle(obj[0].numpy()))
+axes[1].set_title("initial object phase")
+for ax in axes:
+    ax.set_aspect("equal")
+plt.tight_layout()
+plt.show()
 
 #%% ---------------------------------------------------------------- options
 
@@ -410,17 +431,9 @@ options.object_options.optimizable = True
 options.object_options.optimizer = api.Optimizers.ADAM
 options.object_options.step_size = object_step_size
 options.object_options.pixel_size_m = pixel_size_m
-options.object_options.determine_position_origin_coords_by = (
-    api.ObjectPosOriginCoordsMethods.SUPPORT
-)
-# MUST be off for DIP. It defaults to enabled with stride=10: every 10 epochs it rescales
-# the object so mean transmission ~1 and counter-scales the probe. With DIP the object is
-# regenerated by the network on the next forward pass, so the object half of that rescale
-# is instantly discarded while the probe half is permanent -- the probe gets kicked every
-# 10 epochs and has to re-converge. Measured on S0206: this is the entire cause of both
-# the rising early loss and the 10-epoch sawtooth, and turning it off made the loss
-# monotonic and 2.5x lower by epoch 23 (0.58 vs 1.47).
-options.object_options.remove_object_probe_ambiguity.enabled = False
+# options.object_options.determine_position_origin_coords_by = (
+    # api.ObjectPosOriginCoordsMethods.SUPPORT
+# )
 # fracPy object constraints (all off in the source script):
 # options.object_options.l2_norm_constraint.enabled = True
 # options.object_options.l2_norm_constraint.weight = 1e-3
@@ -447,7 +460,7 @@ if position_start is None:
 else:
     options.probe_position_options.optimizable = True
     options.probe_position_options.optimizer = api.Optimizers.SGD
-    options.probe_position_options.step_size = 0.3
+    options.probe_position_options.step_size = 0.1
     options.probe_position_options.optimization_plan = OptimizationPlan(start=position_start)
     options.probe_position_options.constrain_position_mean = True
     options.probe_position_options.correction_options.correction_type = (
@@ -468,11 +481,7 @@ if n_opr_modes > 1 and opr_start is not None:
     options.opr_mode_weight_options.optimize_eigenmode_weights = True
     options.opr_mode_weight_options.optimize_intensity_variation = optimize_intensity_variation
     options.opr_mode_weight_options.optimization_plan = OptimizationPlan(start=opr_start)
-    # NOT update_relaxation: that is LSQML-only (see the TODO at
-    # ptychi/data_structures/opr_mode_weights.py:23) and is silently ignored here, so
-    # step_size is the only thing damping the OPR update on the autodiff path.
-    options.opr_mode_weight_options.optimizer = api.Optimizers.SGD
-    options.opr_mode_weight_options.step_size = opr_step_size
+    options.opr_mode_weight_options.update_relaxation = 0.01
 else:
     options.opr_mode_weight_options.optimizable = False
 
@@ -494,25 +503,6 @@ task = PtychographyTask(
     probe_position_x_px=positions_px[:, 1],
     opr_mode_weights_data=opr_weights,
 )
-
-# Override the DIP generator input z (see the dip_input_* knobs above). nn_input is a
-# registered buffer on the DIPPlanarObject, so reassigning it is enough; draw on the CPU
-# with an explicit generator so the result is reproducible independently of device and of
-# whatever else has consumed the global RNG by this point.
-if dip_input_seed is not None:
-    _buf = task.object.nn_input
-    _g = torch.Generator(device="cpu").manual_seed(dip_input_seed)
-    if dip_input_dist == "normal":
-        _z = torch.randn(_buf.shape, generator=_g) * dip_input_scale
-    elif dip_input_dist == "uniform":
-        _z = torch.rand(_buf.shape, generator=_g) * dip_input_scale
-    else:
-        raise ValueError(f"dip_input_dist must be 'uniform' or 'normal', got {dip_input_dist!r}")
-    task.object.nn_input = _z.to(device=_buf.device, dtype=_buf.dtype)
-    print(
-        f"DIP input z: {dip_input_dist}, scale {dip_input_scale}, seed {dip_input_seed}, "
-        f"{tuple(_z.shape)} on {_buf.device}"
-    )
 
 
 #%% ---------------------------------------------------------------- run
