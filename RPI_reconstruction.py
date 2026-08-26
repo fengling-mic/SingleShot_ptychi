@@ -71,6 +71,11 @@ out_dir = Path(__file__).parent / "recon_out" / scan
 # data (useful to debug the structure without the data share).
 use_simulated_data = False
 
+# Single-shot ("RPI") mode: reconstruct only one diffraction pattern, treated as
+# an isolated measurement with no scan overlap, instead of the full stitched scan.
+single_shot = True
+single_shot_frame_index = 40      # index into the loaded scan's patterns/positions
+
 
 #%% ---------------------------------------------------------------- geometry & knobs
 
@@ -190,6 +195,20 @@ else:
     patterns = np.ascontiguousarray(patterns, dtype=np.float32)
     np.clip(patterns, 0, None, out=patterns)
 
+if single_shot:
+    # Override knobs that don't make sense for one frame. Placed after the
+    # use_simulated_data branch above (which sets its own n_probe_modes /
+    # n_opr_modes / batch_size / object_padding_px) so these always win.
+    n_probe_modes = 5        # tunable: single-shot keeps incoherent probe modes
+    n_opr_modes = 1          # a single frame carries no probe-variation information
+    opr_start = None
+    position_start = None    # nothing to correct a single position against
+    batch_size = 1           # only one diffraction pattern
+    num_epochs = 2500        # mirror fracPy: 500 object-only iters + 2000 joint iters
+    probe_start = 500        # freeze probe first (fracPy stage 1), then refine jointly (stage 2)
+
+    patterns = patterns[single_shot_frame_index : single_shot_frame_index + 1]
+
 print(f"ptychogram: {patterns.shape}, total counts {patterns.sum():.3e}")
 
 
@@ -221,8 +240,14 @@ if not use_simulated_data:
     if flip_positions_x:
         positions_px[:, 1] = -positions_px[:, 1]
 
+if single_shot:
+    positions_px = positions_px[single_shot_frame_index : single_shot_frame_index + 1]
+    object_padding_px = 0   # object == illuminated probe footprint, no scan-stitching buffer
+
 # Pty-Chi maps position (0, 0) to the center of the object buffer
 # (object_options.determine_position_origin_coords_by), so keep the scan centered.
+# For single-shot (one position), this collapses that position to (0, 0), matching
+# fracPy's simuData.encoder = np.zeros((1, 2)) -- no scanning, dead center.
 positions_px = positions_px - positions_px.mean(axis=0, keepdims=True)
 
 assert len(positions_px) == len(patterns), (
@@ -314,92 +339,153 @@ plt.show()
 
 #%% ---------------------------------------------------------------- options
 
-options = api.LSQMLOptions()
+if single_shot:
+    # Pty-Chi has no MPIEOptions; its own test suite maps fracPy's mPIE onto
+    # RPIEOptions with an SGD optimizer + momentum, which is what's used here.
+    options = api.RPIEOptions()
 
-# --- data / geometry ---
-options.data_options.wavelength_m = wavelength_m
-options.data_options.free_space_propagation_distance_m = np.inf if far_field else det_dist_m
-# Measured patterns have DC at the center; the far-field forward model does not
-# shift after the FFT, so the data must be pre-shifted. Near-field involves no
-# Fraunhofer FFT, so it must not be shifted.
-options.data_options.fft_shift = far_field
-options.data_options.save_data_on_device = False   # True is faster if it fits in VRAM
+    # --- data / geometry ---
+    options.data_options.wavelength_m = wavelength_m
+    options.data_options.free_space_propagation_distance_m = np.inf if far_field else det_dist_m
+    options.data_options.fft_shift = far_field
+    options.data_options.save_data_on_device = False
 
-# --- reconstructor ---
-options.reconstructor_options.num_epochs = num_epochs
-options.reconstructor_options.batch_size = batch_size
-options.reconstructor_options.batching_mode = batching_mode
-options.reconstructor_options.noise_model = noise_model
-options.reconstructor_options.momentum_acceleration_gain = momentum_gain
-options.reconstructor_options.default_device = device
-options.reconstructor_options.default_dtype = dtype
-options.reconstructor_options.random_seed = random_seed
-options.reconstructor_options.rescale_probe_intensity_in_first_epoch = True
+    # --- reconstructor ---
+    options.reconstructor_options.num_epochs = num_epochs
+    options.reconstructor_options.batch_size = batch_size
+    options.reconstructor_options.default_device = device
+    options.reconstructor_options.default_dtype = dtype
+    options.reconstructor_options.random_seed = random_seed
 
-# --- object ---
-options.object_options.optimizable = True
-options.object_options.optimizer = api.Optimizers.SGD
-options.object_options.step_size = 1.0
-options.object_options.pixel_size_m = pixel_size_m
-options.object_options.build_preconditioner_with_all_modes = True
-options.object_options.determine_position_origin_coords_by = (
-    api.ObjectPosOriginCoordsMethods.SUPPORT
-)
-# fracPy object constraints (all off in the source script):
-# options.object_options.l2_norm_constraint.enabled = True
-# options.object_options.l2_norm_constraint.weight = 1e-3
-# options.object_options.smoothness_constraint.enabled = True
-# options.object_options.smoothness_constraint.alpha = 0.05
+    # --- object --- (mirrors fracPy engine_mPIE.betaObject = 0.25; rPIE's alpha +
+    # SGD momentum is the concrete stand-in for "mPIE" in Pty-Chi)
+    options.object_options.optimizable = True
+    options.object_options.optimizer = api.Optimizers.SGD
+    options.object_options.optimizer_params = {"momentum": 0.1, "nesterov": True}
+    options.object_options.step_size = 0.25
+    options.object_options.alpha = 1.0
+    options.object_options.pixel_size_m = pixel_size_m
+    options.object_options.build_preconditioner_with_all_modes = True
+    options.object_options.determine_position_origin_coords_by = (
+        api.ObjectPosOriginCoordsMethods.SUPPORT
+    )
+    # Pty-Chi's object ROI bbox is built from positions.min()/max() (object.py
+    # build_roi_bounding_box); with a single position that collapses to a
+    # zero-size box, so remove_object_probe_ambiguity (on by default, fires at
+    # epoch 0) divides by mean-of-empty-tensor = NaN, corrupting object+probe.
+    options.object_options.remove_object_probe_ambiguity.enabled = False
 
-# --- probe ---
-options.probe_options.optimizable = True
-options.probe_options.optimizer = api.Optimizers.SGD
-options.probe_options.step_size = 1.0
-options.probe_options.optimization_plan = OptimizationPlan(start=probe_start)
-options.probe_options.orthogonalize_incoherent_modes.enabled = n_probe_modes > 1
-options.probe_options.orthogonalize_incoherent_modes.optimization_plan = OptimizationPlan(
-    stride=orthogonalization_stride
-)
-options.probe_options.orthogonalize_incoherent_modes.method = api.OrthogonalizationMethods.SVD
-options.probe_options.orthogonalize_opr_modes.enabled = n_opr_modes > 1
-options.probe_options.power_constraint.enabled = False      # fracPy probePowerCorrectionSwitch
-options.probe_options.center_constraint.enabled = False     # fracPy comStabilizationSwitch
+    # --- probe --- (frozen until probe_start, mirrors fracPy stage 1 -> stage 2)
+    options.probe_options.optimizable = True
+    options.probe_options.optimizer = api.Optimizers.SGD
+    options.probe_options.optimizer_params = {"momentum": 0.1, "nesterov": True}
+    options.probe_options.step_size = 0.25
+    options.probe_options.alpha = 1.0
+    options.probe_options.optimization_plan = OptimizationPlan(start=probe_start)
+    options.probe_options.orthogonalize_incoherent_modes.enabled = n_probe_modes > 1
+    options.probe_options.orthogonalize_incoherent_modes.optimization_plan = OptimizationPlan(
+        stride=orthogonalization_stride
+    )
+    options.probe_options.orthogonalize_incoherent_modes.method = api.OrthogonalizationMethods.SVD
+    options.probe_options.orthogonalize_opr_modes.enabled = False
+    options.probe_options.power_constraint.enabled = False
+    options.probe_options.center_constraint.enabled = False
 
-# --- probe positions (fracPy pcPIE) ---
-if position_start is None:
+    # --- probe positions / OPR: meaningless with a single position ---
     options.probe_position_options.optimizable = False
-else:
-    options.probe_position_options.optimizable = True
-    options.probe_position_options.optimizer = api.Optimizers.SGD
-    options.probe_position_options.step_size = 0.3
-    options.probe_position_options.optimization_plan = OptimizationPlan(start=position_start)
-    options.probe_position_options.constrain_position_mean = True
-    options.probe_position_options.correction_options.correction_type = (
-        api.PositionCorrectionTypes.GRADIENT
-    )
-    options.probe_position_options.correction_options.differentiation_method = (
-        api.ImageGradientMethods.FOURIER_DIFFERENTIATION
-    )
-    options.probe_position_options.correction_options.update_magnitude_limit = (
-        position_update_limit_px
-    )
-    options.probe_position_options.correction_options.clip_update_magnitude_by_mad = True
-    options.probe_position_options.momentum_acceleration_gain = 0.5
-
-# --- OPR mode weights (variable probe) ---
-if n_opr_modes > 1 and opr_start is not None:
-    options.opr_mode_weight_options.optimizable = True
-    options.opr_mode_weight_options.optimize_eigenmode_weights = True
-    options.opr_mode_weight_options.optimize_intensity_variation = optimize_intensity_variation
-    options.opr_mode_weight_options.optimization_plan = OptimizationPlan(start=opr_start)
-    options.opr_mode_weight_options.update_relaxation = 0.1
-else:
     options.opr_mode_weight_options.optimizable = False
 
-print(
-    f"schedule: object 0-, probe {probe_start}-, OPR {opr_start}-, positions {position_start}-, "
-    f"{num_epochs} epochs on {device}"
-)
+    print(
+        f"single-shot frame {single_shot_frame_index}: object 0-, probe {probe_start}-, "
+        f"{num_epochs} iters on {device}"
+    )
+else:
+    options = api.LSQMLOptions()
+
+    # --- data / geometry ---
+    options.data_options.wavelength_m = wavelength_m
+    options.data_options.free_space_propagation_distance_m = np.inf if far_field else det_dist_m
+    # Measured patterns have DC at the center; the far-field forward model does not
+    # shift after the FFT, so the data must be pre-shifted. Near-field involves no
+    # Fraunhofer FFT, so it must not be shifted.
+    options.data_options.fft_shift = far_field
+    options.data_options.save_data_on_device = False   # True is faster if it fits in VRAM
+
+    # --- reconstructor ---
+    options.reconstructor_options.num_epochs = num_epochs
+    options.reconstructor_options.batch_size = batch_size
+    options.reconstructor_options.batching_mode = batching_mode
+    options.reconstructor_options.noise_model = noise_model
+    options.reconstructor_options.momentum_acceleration_gain = momentum_gain
+    options.reconstructor_options.default_device = device
+    options.reconstructor_options.default_dtype = dtype
+    options.reconstructor_options.random_seed = random_seed
+    options.reconstructor_options.rescale_probe_intensity_in_first_epoch = True
+
+    # --- object ---
+    options.object_options.optimizable = True
+    options.object_options.optimizer = api.Optimizers.SGD
+    options.object_options.step_size = 1.0
+    options.object_options.pixel_size_m = pixel_size_m
+    options.object_options.build_preconditioner_with_all_modes = True
+    options.object_options.determine_position_origin_coords_by = (
+        api.ObjectPosOriginCoordsMethods.SUPPORT
+    )
+    # fracPy object constraints (all off in the source script):
+    # options.object_options.l2_norm_constraint.enabled = True
+    # options.object_options.l2_norm_constraint.weight = 1e-3
+    # options.object_options.smoothness_constraint.enabled = True
+    # options.object_options.smoothness_constraint.alpha = 0.05
+
+    # --- probe ---
+    options.probe_options.optimizable = True
+    options.probe_options.optimizer = api.Optimizers.SGD
+    options.probe_options.step_size = 1.0
+    options.probe_options.optimization_plan = OptimizationPlan(start=probe_start)
+    options.probe_options.orthogonalize_incoherent_modes.enabled = n_probe_modes > 1
+    options.probe_options.orthogonalize_incoherent_modes.optimization_plan = OptimizationPlan(
+        stride=orthogonalization_stride
+    )
+    options.probe_options.orthogonalize_incoherent_modes.method = api.OrthogonalizationMethods.SVD
+    options.probe_options.orthogonalize_opr_modes.enabled = n_opr_modes > 1
+    options.probe_options.power_constraint.enabled = False      # fracPy probePowerCorrectionSwitch
+    options.probe_options.center_constraint.enabled = False     # fracPy comStabilizationSwitch
+
+    # --- probe positions (fracPy pcPIE) ---
+    if position_start is None:
+        options.probe_position_options.optimizable = False
+    else:
+        options.probe_position_options.optimizable = True
+        options.probe_position_options.optimizer = api.Optimizers.SGD
+        options.probe_position_options.step_size = 0.3
+        options.probe_position_options.optimization_plan = OptimizationPlan(start=position_start)
+        options.probe_position_options.constrain_position_mean = True
+        options.probe_position_options.correction_options.correction_type = (
+            api.PositionCorrectionTypes.GRADIENT
+        )
+        options.probe_position_options.correction_options.differentiation_method = (
+            api.ImageGradientMethods.FOURIER_DIFFERENTIATION
+        )
+        options.probe_position_options.correction_options.update_magnitude_limit = (
+            position_update_limit_px
+        )
+        options.probe_position_options.correction_options.clip_update_magnitude_by_mad = True
+        options.probe_position_options.momentum_acceleration_gain = 0.5
+
+    # --- OPR mode weights (variable probe) ---
+    if n_opr_modes > 1 and opr_start is not None:
+        options.opr_mode_weight_options.optimizable = True
+        options.opr_mode_weight_options.optimize_eigenmode_weights = True
+        options.opr_mode_weight_options.optimize_intensity_variation = optimize_intensity_variation
+        options.opr_mode_weight_options.optimization_plan = OptimizationPlan(start=opr_start)
+        options.opr_mode_weight_options.update_relaxation = 0.1
+    else:
+        options.opr_mode_weight_options.optimizable = False
+
+    print(
+        f"schedule: object 0-, probe {probe_start}-, OPR {opr_start}-, positions {position_start}-, "
+        f"{num_epochs} epochs on {device}"
+    )
 
 
 #%% ---------------------------------------------------------------- build task
@@ -429,8 +515,10 @@ recon_probe = task.get_data_to_cpu("probe", as_numpy=True)[0]
 recon_pos = task.get_data_to_cpu("probe_positions", as_numpy=True)
 loss_table = task.reconstructor.loss_tracker.table
 
+phase_crop = np.angle(recon_obj) if single_shot else np.angle(recon_obj[380:480, 480:580])
+
 fig, axes = plt.subplots(1, 3, figsize=(15, 7))
-axes[0].imshow(np.angle(recon_obj[380:480, 480:580]), cmap="gray")
+axes[0].imshow(phase_crop, cmap="gray")
 axes[0].set_title("object phase")
 axes[1].imshow(np.abs(recon_obj), cmap="gray")
 axes[1].set_title("object magnitude")
@@ -462,7 +550,10 @@ if position_start is not None:
 # Same layout as the beamline recon_Niter*.h5 files, so these results can be fed
 # back in through init_recon_file.
 out_dir.mkdir(parents=True, exist_ok=True)
-out_file = out_dir / f"recon_Niter{num_epochs}.h5"
+out_file = out_dir / (
+    f"recon_frame{single_shot_frame_index}_Niter{num_epochs}.h5"
+    if single_shot else f"recon_Niter{num_epochs}.h5"
+)
 
 with h5py.File(out_file, "w") as f:
     f.create_dataset("object", data=task.get_data_to_cpu("object", as_numpy=True))
@@ -473,9 +564,8 @@ with h5py.File(out_file, "w") as f:
     f.attrs["wavelength_m"] = wavelength_m
     f.attrs["detector_distance_m"] = det_dist_m
     f.attrs["num_epochs"] = num_epochs
+    if single_shot:
+        f.attrs["frame_index"] = single_shot_frame_index
 
 loss_table.to_csv(out_dir / "loss.csv", index=False)
 print(f"saved {out_file}")
-
-# %%
-# reconstruct the RPI data
