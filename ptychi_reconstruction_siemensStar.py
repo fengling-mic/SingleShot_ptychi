@@ -302,6 +302,15 @@ obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_sl
 
 print(f"object buffer: {tuple(obj.shape)}")
 
+fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+axes[0].imshow(np.abs(obj[0].numpy()), cmap="inferno")
+axes[0].set_title("initial object magnitude")
+axes[1].imshow(np.angle(obj[0].numpy()), cmap="inferno")
+axes[1].set_title("initial object phase")
+for ax in axes:
+    ax.set_aspect("equal")
+plt.tight_layout()
+plt.show()
 
 #%% ---------------------------------------------------------------- options
 
