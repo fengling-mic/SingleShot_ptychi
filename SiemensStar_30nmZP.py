@@ -23,7 +23,7 @@
 #   params.positionCorrectionSwitch-> probe_position_options.optimizable
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"  # This makes GPU N appear as GPU 0 to CuPy
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # This makes GPU N appear as GPU 0 to CuPy
 
 import logging
 from pathlib import Path
@@ -50,9 +50,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 #%% ---------------------------------------------------------------- paths
 
-scan = "S0125"
-scan_initialGuess = "S0125"  # scan used to generate the initial guess (positions + probe)
-data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_2/01_ptycho")
+scan = "S1567"
+scan_initialGuess = "S1567"  # scan used to generate the initial guess (positions + probe)
+data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_2/02_levitan")
 
 dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.hdf5"
 para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
@@ -62,7 +62,7 @@ para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
 # positions and a synthesized probe instead.
 init_recon_file = (
     data_root / "ptychi_recons" / scan_initialGuess
-    / "Ndp512_LSQML_c150_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter1000.h5"
+    / "Ndp600_LSQML_c30_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter1000.h5"
 )
 
 out_dir = Path(__file__).parent / "recon_out" / scan
@@ -74,7 +74,7 @@ use_simulated_data = False
 
 #%% ---------------------------------------------------------------- geometry & knobs
 
-n_dp = 512                       # detector crop, fracPy cropSize
+n_dp = 600                       # detector crop, fracPy cropSize
 wavelength_m = 0.155e-9          # fracPy exampleData.wavelength
 det_pixel_m = 172e-6             # fracPy exampleData.dxd
 det_dist_m = 10.0                # fracPy exampleData.zo
@@ -430,8 +430,7 @@ recon_pos = task.get_data_to_cpu("probe_positions", as_numpy=True)
 loss_table = task.reconstructor.loss_tracker.table
 
 fig, axes = plt.subplots(1, 3, figsize=(15, 7))
-# axes[0].imshow(np.angle(recon_obj[380:480, 480:580]), cmap="gray")
-axes[0].imshow(np.angle(recon_obj), cmap="gray")
+axes[0].imshow(np.angle(recon_obj[500:600,450:550]), cmap="gray")
 axes[0].set_title("object phase")
 axes[1].imshow(np.abs(recon_obj), cmap="gray")
 axes[1].set_title("object magnitude")

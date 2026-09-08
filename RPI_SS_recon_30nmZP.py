@@ -42,9 +42,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 #%% ---------------------------------------------------------------- paths
 
-scan = "S0206"
-scan_initialGuess = "S0206"  # scan used to generate the initial guess (positions + probe)
-data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_2/01_ptycho")
+scan = "S1567"
+scan_initialGuess = "S1567"  # scan used to generate the initial guess (positions + probe)
+data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_2/02_levitan")
 
 dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.hdf5"
 para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
@@ -54,7 +54,7 @@ para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
 # synthesized probe instead.
 init_recon_file = (
     data_root / "ptychi_recons" / scan_initialGuess
-    / "Ndp512_LSQML_c150_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter500.h5"
+        / "Ndp600_LSQML_c30_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter1000.h5"
 )
 
 out_dir = Path(__file__).parent / "recon_out" / scan
@@ -63,7 +63,7 @@ out_dir = Path(__file__).parent / "recon_out" / scan
 # synthetic multi-position dataset (useful to debug the structure without the data share).
 use_simulated_data = False
 
-frame_index = 42   # index into the loaded scan's patterns/positions to reconstruct
+frame_index = 62   # index into the loaded scan's patterns/positions to reconstruct
 
 
 #%% ---------------------------------------------------------------- geometry & knobs
