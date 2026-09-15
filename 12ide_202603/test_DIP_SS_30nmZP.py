@@ -92,7 +92,7 @@ rpi_resolution_ratio = 0.4
 rpi_kp_quantile = 0.95           # fraction of probe far-field power used to define kp
 
 # --- optimizer --------------------------------------------------------------
-num_epochs = 2500                # max Adam iterations per restart. Plain pixels converge
+num_epochs = 1500                # max Adam iterations per restart. Plain pixels converge
                                  # by ~250; DIP keeps improving and bottoms out near 4500.
 rpi_lr = 0.01                    # Adam step on an object of magnitude ~1
 rpi_lr_decay_factor = 0.5
@@ -176,19 +176,19 @@ dip_lr = 1e-4                    # Adam lr on network WEIGHTS, not on pixels. Th
 dip_lr_decay_patience = 300      # DIP needs a longer high-lr phase than plain pixels do:
                                  # measured eps 0.109 at patience 200 vs 0.118 at 100
 dip_seed = 0                     # seeds the fixed network input
-dip_input_speckle_px = 1         # speckle grain of the fixed input z, in pixels. z is drawn
-                                 # on an (n/grain, n/grain) grid and bilinearly upsampled, so
-                                 # neighbouring pixels stay correlated over ~grain px. 1 (or
-                                 # anything below it) gives the DIP reference input, white
-                                 # U[0, 0.1) noise -- one pixel is the finest grain a pixel
-                                 # grid can carry, so there is nothing below 1 to reach for.
+dip_input_speckle_px = 1         # speckle GRAIN of the fixed input z, in pixels. 1 = the DIP
+                                 # reference input, i.i.d. U[0, 0.1) per pixel, i.e. white
+                                 # noise with a one-pixel grain. Larger values low-pass the
+                                 # noise to that correlation length, so z becomes a coarse
+                                 # speckle field instead of a white one.
                                  #
-                                 # MEASURED: this changes z as asked but does NOT change the
-                                 # untrained object. Its phase grain sits at 3-4 px for every
-                                 # value from 1 to 64, because the random decoder's upsampling
-                                 # and ReLU harmonics regenerate pixel-scale structure. Object
-                                 # grain is set by dip_num_levels (2 levels -> ~2 px, 3 -> ~5),
-                                 # not here.
+                                 # This is the input knob that survives dip_use_batchnorm:
+                                 # BatchNorm renormalizes each channel's mean and variance, so
+                                 # it cancels the input AMPLITUDE outright, but it leaves
+                                 # spatial STRUCTURE untouched. The grain therefore propagates
+                                 # into the untrained object, which is what stage 2 starts
+                                 # from. Range is renormalized to [0, 0.1) after filtering so
+                                 # only the grain changes, not the amplitude.
 
 # fracPy flip switches
 flip_dp_x = False
@@ -289,6 +289,28 @@ def fourier_resample(arr, n_out):
         spec = np.pad(spec, pad)
     out = np.fft.ifft2(np.fft.ifftshift(spec, axes=axes), norm="ortho", axes=axes)
     return out * (n_out / n_in)
+
+
+def speckle_lowpass(z, grain_px):
+    """Turn white noise into a speckle field with a `grain_px`-pixel correlation length.
+
+    Fully developed speckle is what you get when a random field is band-limited: keeping
+    only |k| <= n / (2 * grain_px) leaves structure no finer than grain_px pixels. Applied
+    per channel to the DIP input, this is the one input property BatchNorm cannot undo --
+    it renormalizes each channel's mean and variance but not its spatial correlations.
+
+    The result is rescaled back to [0, 1) per channel, because low-pass filtering removes
+    most of the variance and an unrescaled field would just be a near-constant one. So
+    grain_px changes the grain and nothing else.
+    """
+    n = z.shape[-1]
+    ky = torch.fft.fftfreq(n).view(-1, 1)
+    kx = torch.fft.fftfreq(n).view(1, -1)
+    keep = (ky ** 2 + kx ** 2).sqrt() <= 0.5 / grain_px
+    out = torch.fft.ifft2(torch.fft.fft2(z) * keep).real
+    lo = out.amin(dim=(-2, -1), keepdim=True)
+    hi = out.amax(dim=(-2, -1), keepdim=True)
+    return (out - lo) / (hi - lo).clamp_min(1e-12)
 
 
 def fourier_upsample_object(obj_lowres, n_full):
@@ -392,17 +414,14 @@ class DIPObjectGenerator:
             scaled_tanh_on_phase=scaled_tanh_on_phase,
         ).to(device)
         # The DIP input is drawn ONCE and held fixed; only the weights are optimized.
-        # Drawing z per pixel decorrelates at 1 px, so to get a coarser grain draw it on an
-        # (n_low, n_low) grid instead and upsample back, keeping neighbours correlated over
-        # ~input_speckle_px pixels. n_low is clamped to n_out, so any grain <= 1 is the
-        # reference white U[0, 0.1) input -- 1 px is the finest a pixel grid can carry.
+        # `input_speckle_px` sets its GRAIN: 1 is the reference white U[0, 0.1) noise, larger
+        # values low-pass it into a coarser speckle field. Seed and grain are separate knobs
+        # on purpose -- the seed picks a realization, the grain changes the statistics.
         self.input_speckle_px = input_speckle_px
-        n_low = min(n_out, max(2, round(n_out / input_speckle_px)))
         g = torch.Generator().manual_seed(seed)
-        z = torch.rand((1, in_channels, n_low, n_low), generator=g)
-        if n_low != n_out:
-            z = torch.nn.functional.interpolate(z, size=(n_out, n_out), mode="bilinear",
-                                                align_corners=False)
+        z = torch.rand((1, in_channels, n_out, n_out), generator=g)
+        if input_speckle_px > 1:
+            z = speckle_lowpass(z, input_speckle_px)
         self.z = (z * 0.1).to(device)
 
     def __call__(self):
@@ -811,18 +830,8 @@ for restart in range(rpi_num_restarts):
 
     # ---- stage 2: DIP takes over the object ------------------------------------
     if use_dip:
-        # With no stage 1 to inherit, start DIP from the SAME random field plain-pixel RPI
-        # starts from, instead of the flat vacuum object. Drawn i.i.d. per pixel, so its
-        # grain is 1 px in both amplitude and phase -- finer than anything the untrained
-        # network emits, whose decoder correlates neighbours over ~3 px.
-        noise = torch.randn(dip_n_out, dip_n_out, dtype=torch.float32, device=torch_device) \
-            + 1j * torch.randn(dip_n_out, dip_n_out, dtype=torch.float32, device=torch_device)
-        if rpi_object_init == "random":            # the paper's init (its objects were random)
-            warm = rpi_init_sigma * noise
-        else:                                      # a transmission object sits near 1
-            warm = torch.ones_like(noise) + rpi_init_sigma * noise
-        warm = warm.to(get_default_complex_dtype())
-        if obj_leaf is not None:                   # a real stage-1 result beats the random field
+        warm = None
+        if obj_leaf is not None:
             warm = obj_leaf.detach()
             if dip_grid == "fullres":
                 warm = fourier_upsample_object(warm, n_dp).detach()
@@ -838,11 +847,6 @@ for restart in range(rpi_num_restarts):
             print(f"  network has {generator.n_parameters() / 1e6:.2f}M weights for "
                   f"{n_obj_pixels / 1e3:.1f}k object values -- DIP is not a dimensionality "
                   f"reduction, its prior is the architecture plus early stopping")
-            if dip_parameterization == "direct":
-                print("  WARNING: dip_parameterization='direct' IGNORES the base, so the "
-                      "1 px RPI random init above is discarded and DIP starts from the "
-                      "untrained network's own ~3 px output. Use 'residual_zeroconv' to "
-                      "actually start from it.")
 
         # What DIP actually STARTS from, before a single weight update. Worth seeing: for
         # "direct" and "refine" the untrained network emits randomness regardless of its

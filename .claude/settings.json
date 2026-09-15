@@ -32,7 +32,9 @@
       "Bash(nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,memory.free --format=csv,noheader)",
       "Bash(awk -F', ' '{printf \"  idx %-3s %-12s total %-10s free %-10s %s\\\\n\", $1, $3, $4, $6, \\($6+0>20000?\"<== USABLE\":\"\"\\)}')",
       "Bash(python -c \"import ast; ast.parse\\(open\\('test_DIP_SS_30nmZP.py'\\).read\\(\\)\\)\")",
-      "WebFetch(domain:ar5iv.labs.arxiv.org)"
+      "WebFetch(domain:ar5iv.labs.arxiv.org)",
+      "Read(//mnt/**)",
+      "Read(//mnt/micdata2/4IDD/**)"
     ],
     "additionalDirectories": [
       "/home/beams/FENGLING.ZHANG/SingleShot_ptychi",
