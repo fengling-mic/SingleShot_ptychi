@@ -547,7 +547,8 @@ def use_inline_backend(verbose=True):
 
 
 def show_ptychogram(patterns, index=None, log=True, cmap="inferno", transpose=False,
-                    clim=None, figsize=(6.0, 6.6), interactive=False, **grid_kwargs):
+                    clim=None, figsize=(6.0, 6.6), interactive=False, force_inline=True,
+                    **grid_kwargs):
     """fracPy's exampleData.showPtychogram(): look through the diffraction stack.
 
     Plain inline figures by default -- no ipympl canvas, nothing to click:
@@ -557,6 +558,11 @@ def show_ptychogram(patterns, index=None, log=True, cmap="inferno", transpose=Fa
                               (n_show, tile, ...) are passed on to it
         index=<int>           just that one frame, full size
 
+    If the session is left on a widget backend (by an earlier call, or by
+    beamPropagation.py), this switches it back to inline first, so the figure
+    is a plain PNG that VS Code's plot viewer can expand. Pass
+    force_inline=False to leave whatever backend is in force alone.
+
     interactive=True instead switches the backend to ipympl and draws the
     slider version (drag it, or use the left/right arrow keys). That canvas
     then takes over every later figure in the session, so it is opt-in;
@@ -565,6 +571,9 @@ def show_ptychogram(patterns, index=None, log=True, cmap="inferno", transpose=Fa
     from matplotlib.widgets import Slider
 
     if not interactive:
+        if force_inline and any(k in matplotlib.get_backend().lower()
+                                for k in ("ipympl", "nbagg", "widget")):
+            use_inline_backend()
         if index is None:
             return show_ptychogram_grid(patterns, log=log, cmap=cmap, transpose=transpose,
                                         clim=clim, **grid_kwargs)
