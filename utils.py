@@ -1,7 +1,9 @@
 import json
+import os
 from pathlib import Path
 
 import h5py
+import matplotlib
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -459,15 +461,75 @@ def _dp_clim(patterns, log, transpose, n_sample=20):
     return 0.0, float(max(_dp_frame(patterns, i, log, transpose).max() for i in idx))
 
 
+def use_interactive_backend(verbose=True):
+    """Switch matplotlib to a backend whose widgets actually respond.
+
+    The VS Code interactive window and Jupyter default to the inline backend,
+    which renders each figure to a PNG -- a Slider drawn on it is a picture of
+    a slider, and dragging does nothing. The three cases that matter here:
+
+    * a notebook kernel (VS Code interactive window included) -> ipympl, which
+      draws into the cell and needs no X server, so it works over plain SSH;
+    * a real desktop session (DISPLAY or WAYLAND_DISPLAY) -> TkAgg;
+    * neither -> leave the backend alone.
+
+    Returns True if the backend in force can handle widgets. Call it *before*
+    creating the figure -- switching afterwards leaves the old canvas behind.
+    """
+    backend = matplotlib.get_backend().lower()
+    if any(k in backend for k in ("ipympl", "nbagg", "widget", "qt", "tk", "gtk", "macosx")):
+        return True
+
+    try:
+        from IPython import get_ipython
+        shell = get_ipython()
+    except ImportError:
+        shell = None
+
+    if shell is not None and shell.__class__.__name__ == "ZMQInteractiveShell":
+        try:
+            import ipympl  # noqa: F401
+        except ImportError:
+            if verbose:
+                print("Running in a kernel but ipympl is missing -- the slider will be dead.\n"
+                      "  Fix with:  pip install ipympl   (then restart the kernel)")
+            return False
+        shell.run_line_magic("matplotlib", "widget")
+        if verbose:
+            print(f"matplotlib backend -> {matplotlib.get_backend()} (was inline; "
+                  "widgets need it)")
+        return True
+
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        matplotlib.use("TkAgg")
+        if verbose:
+            print("matplotlib backend -> TkAgg")
+        return True
+
+    return False
+
+
 def show_ptychogram(patterns, index=0, log=True, cmap="inferno", transpose=False,
-                    clim=None, figsize=(6.0, 6.6)):
+                    clim=None, figsize=(6.0, 6.6), interactive=True):
     """fracPy's exampleData.showPtychogram(): scroll through the diffraction stack.
 
-    Drag the slider or use the left/right arrow keys. Needs an interactive
-    backend (`%matplotlib widget` or `%matplotlib qt`); with the inline backend
-    only frame `index` is drawn, so use show_ptychogram_grid() instead.
+    Drag the slider or use the left/right arrow keys. The matplotlib backend is
+    switched to ipympl first (see `use_interactive_backend`), because on the
+    inline backend the slider is only a picture of a slider; if no interactive
+    backend can be had, this falls back to `show_ptychogram_grid`. Pass
+    interactive=False to skip the switch and draw just frame `index`.
+
+    In the VS Code interactive window the first call prints the backend change,
+    and the figure then appears in an ipympl canvas -- if that canvas comes up
+    blank, re-run the cell once (a known ipympl quirk on the very first switch).
     """
     from matplotlib.widgets import Slider
+
+    if interactive and not use_interactive_backend():
+        print("No interactive backend available -- showing a montage instead.\n"
+              "  For the slider, run this in the VS Code interactive window (#%% cells).")
+        return show_ptychogram_grid(patterns, log=log, cmap=cmap, transpose=transpose,
+                                    clim=clim)
 
     n = len(patterns)
     if clim is None:
