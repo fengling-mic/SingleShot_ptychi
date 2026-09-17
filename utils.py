@@ -475,6 +475,10 @@ def use_interactive_backend(verbose=True):
 
     Returns True if the backend in force can handle widgets. Call it *before*
     creating the figure -- switching afterwards leaves the old canvas behind.
+
+    Nothing calls this on your behalf: an ipympl canvas takes over every later
+    figure in the session, so opting in is yours to do. `use_inline_backend()`
+    undoes it.
     """
     backend = matplotlib.get_backend().lower()
     if any(k in backend for k in ("ipympl", "nbagg", "widget", "qt", "tk", "gtk", "macosx")):
@@ -509,28 +513,70 @@ def use_interactive_backend(verbose=True):
     return False
 
 
-def show_ptychogram(patterns, index=0, log=True, cmap="inferno", transpose=False,
-                    clim=None, figsize=(6.0, 6.6), interactive=True):
-    """fracPy's exampleData.showPtychogram(): scroll through the diffraction stack.
+def _show_one_frame(patterns, index, log, cmap, transpose, clim, figsize):
+    """One diffraction pattern, full size, on whatever backend is in force."""
+    n = len(patterns)
+    if clim is None:
+        clim = _dp_clim(patterns, log, transpose)
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(_dp_frame(patterns, index, log, transpose),
+                   cmap=cmap, vmin=clim[0], vmax=clim[1])
+    ax.set_xticks([]), ax.set_yticks([])
+    ax.set_title(f"frame {index} / {n - 1}   [{'log10(I + 1)' if log else 'I'}]")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    plt.tight_layout()
+    plt.show()
 
-    Drag the slider or use the left/right arrow keys. The matplotlib backend is
-    switched to ipympl first (see `use_interactive_backend`), because on the
-    inline backend the slider is only a picture of a slider; if no interactive
-    backend can be had, this falls back to `show_ptychogram_grid`. Pass
-    interactive=False to skip the switch and draw just frame `index`.
 
-    In the VS Code interactive window the first call prints the backend change,
-    and the figure then appears in an ipympl canvas -- if that canvas comes up
-    blank, re-run the cell once (a known ipympl quirk on the very first switch).
+def use_inline_backend(verbose=True):
+    """Go back to plain inline PNG figures, undoing `use_interactive_backend()`.
+
+    Only meaningful inside a kernel; elsewhere it leaves the backend alone.
+    """
+    try:
+        from IPython import get_ipython
+        shell = get_ipython()
+    except ImportError:
+        shell = None
+    if shell is None or shell.__class__.__name__ != "ZMQInteractiveShell":
+        return False
+    shell.run_line_magic("matplotlib", "inline")
+    if verbose:
+        print(f"matplotlib backend -> {matplotlib.get_backend()}")
+    return True
+
+
+def show_ptychogram(patterns, index=None, log=True, cmap="inferno", transpose=False,
+                    clim=None, figsize=(6.0, 6.6), interactive=False, **grid_kwargs):
+    """fracPy's exampleData.showPtychogram(): look through the diffraction stack.
+
+    Plain inline figures by default -- no ipympl canvas, nothing to click:
+
+        index=None (default)  a montage of frames spread over the stack,
+                              i.e. `show_ptychogram_grid`; extra keywords
+                              (n_show, tile, ...) are passed on to it
+        index=<int>           just that one frame, full size
+
+    interactive=True instead switches the backend to ipympl and draws the
+    slider version (drag it, or use the left/right arrow keys). That canvas
+    then takes over every later figure in the session, so it is opt-in;
+    `use_inline_backend()` puts things back.
     """
     from matplotlib.widgets import Slider
 
-    if interactive and not use_interactive_backend():
+    if not interactive:
+        if index is None:
+            return show_ptychogram_grid(patterns, log=log, cmap=cmap, transpose=transpose,
+                                        clim=clim, **grid_kwargs)
+        return _show_one_frame(patterns, index, log, cmap, transpose, clim, figsize)
+
+    if not use_interactive_backend():
         print("No interactive backend available -- showing a montage instead.\n"
               "  For the slider, run this in the VS Code interactive window (#%% cells).")
         return show_ptychogram_grid(patterns, log=log, cmap=cmap, transpose=transpose,
-                                    clim=clim)
+                                    clim=clim, **grid_kwargs)
 
+    index = 0 if index is None else index
     n = len(patterns)
     if clim is None:
         clim = _dp_clim(patterns, log, transpose)
