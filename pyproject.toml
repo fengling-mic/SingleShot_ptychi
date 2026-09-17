@@ -1,0 +1,30 @@
+# Makes utils.py importable from anywhere in the ptychi-env virtualenv, so the
+# per-experiment scripts under 4idd_202603/, 12ide202604_1/, ... can just do
+#
+#     from utils import center_crop_or_pad, show_ptychogram, make_probe
+#
+# no matter which directory they are run from. Install once, editable, so edits
+# to utils.py take effect immediately with no reinstall:
+#
+#     ./ptychi-env/bin/pip install -e . --no-deps --no-build-isolation
+#
+# Dependencies are deliberately NOT declared: the environment already has the
+# CUDA build of torch and pty-chi installed editable from the submodule, and
+# listing them here would let pip resolve and replace those. Install with
+# --no-deps to be sure it never tries.
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "singleshot-ptychi"
+version = "0.1.0"
+description = "Shared helpers for the SingleShot ptychography reconstruction scripts"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+# Only the shared helper module. Naming it explicitly also switches off
+# setuptools' auto-discovery, which would otherwise trip over the flat layout
+# (pty-chi/, ptychi-env/, the per-experiment folders).
+py-modules = ["utils"]
