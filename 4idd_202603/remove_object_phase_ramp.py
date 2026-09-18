@@ -49,8 +49,8 @@ from scipy.optimize import minimize
 # \\micdata\data2\4IDD\2026_Sep\ptychi_recons\fly394\... as mounted on the beamline
 # Linux boxes.  Override on the command line.
 default_recon_file = Path(
-    "/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/fly520"
-    "/Ndp256_LSQML_c250_m0.25_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter2000.h5"
+    "/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/fly521"
+    "/Ndp256_LSQML_c500_m0.5_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter2000.h5"
 )
 
 

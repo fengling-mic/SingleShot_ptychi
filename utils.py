@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 from pathlib import Path
@@ -118,15 +119,110 @@ def _asm_transfer(FX, FY, wavelength_m, z_m):
     return H
 
 
+def _smooth(a, sigma_px):
+    """Gaussian blur of `sigma_px`, done on the FFT grid like everything else."""
+    FX, FY = _grid(a.shape[-1], 1.0 / a.shape[-1])
+    return np.real(_ift(_ft(a) * np.exp(-2 * (np.pi * sigma_px) ** 2 * (FX**2 + FY**2))))
+
+
+def _lowpass_noise(size, corr_px, rng, complex_noise=False):
+    """White noise low-passed to a Gaussian blob of `corr_px` pixels rms."""
+    noise = rng.standard_normal((size, size))
+    if complex_noise:
+        noise = (noise + 1j * rng.standard_normal((size, size))) / np.sqrt(2)
+    FX, FY = _grid(size, 1.0 / size)
+    return _ift(_ft(noise) * np.exp(-2 * (np.pi * corr_px) ** 2 * (FX**2 + FY**2)))
+
+
 def _smooth_random_phase(size, rms_rad, corr_px, rng):
     """Low-pass filtered random phase screen, `rms_rad` rad rms."""
-    noise = rng.standard_normal((size, size))
-    FX, FY = _grid(size, 1.0 / size)
-    screen = np.real(_ift(_ft(noise) * np.exp(-2 * (np.pi * corr_px) ** 2 * (FX**2 + FY**2))))
+    screen = np.real(_lowpass_noise(size, corr_px, rng))
     screen -= screen.mean()
     if screen.std() > 0:
         screen *= rms_rad / screen.std()
     return screen
+
+
+def _speckle_modulation(size, contrast, grain_px, rng, phase_only=False):
+    """Complex speckle modulation with unit mean intensity.
+
+    A diffuser dropped onto the plane the aperture is drawn on: white complex
+    Gaussian noise low-passed to a grain of `grain_px` pixels, blended against
+    a flat field with weight `contrast`. At weight 1 that is fully developed
+    speckle -- Rayleigh |s|, uniform arg(s).
+
+    The weight is not itself the intensity contrast: for a blend a + b*s with
+    a = 1 - w, b = w, sigma_I / <I> works out to sqrt(2a^2b^2 + b^4)/(a^2 + b^2),
+    which rises faster than w and is already saturated at 1 by w ~ 0.7:
+
+        w     0.1   0.2   0.3   0.4   0.5   0.7   1.0
+        K     0.18  0.34  0.53  0.72  0.89  0.99  1.00
+
+    With `phase_only` the grains are pure phase (a random phase plate, |s| == 1
+    everywhere) and `contrast` is the phase excursion in radians instead.
+    """
+    if phase_only:
+        return np.exp(1j * _smooth_random_phase(size, contrast, grain_px, rng))
+    s = _lowpass_noise(size, grain_px, rng, complex_noise=True)
+    rms = np.sqrt((np.abs(s) ** 2).mean())
+    if rms > 0:
+        s = s / rms
+    m = (1.0 - contrast) + contrast * s
+    return m / np.sqrt(max((np.abs(m) ** 2).mean(), 1e-300))
+
+
+# A Gaussian-smoothed screen of sigma has autocorrelation FWHM 2.3548*sigma*sqrt(2).
+_SCREEN_FWHM_PER_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0)) * np.sqrt(2.0)   # 3.3302
+
+
+def _speckle_sigma_for_grain(grain_px, rms_rad, phase_only):
+    """Sigma of the smoothing kernel that delivers a `grain_px` wide wavefront.
+
+    The grain is the FWHM of the field autocorrelation -- the speckle you see
+    when you look at the probe -- which is not the correlation length of the
+    screen behind it once the phase wraps.
+
+    For a Gaussian phase screen of rms `s` and normalized screen correlation
+    exp(-r^2 / 4 sigma^2), the field correlation is
+
+        C(r) = exp(-s^2 (1 - exp(-r^2 / 4 sigma^2)))
+
+    and setting C = 1/2 inverts to the expression below. Strong phase only:
+    at small `s` a coherent unscattered component survives at large r, C never
+    reaches 1/2 on the diffuse part alone, and the formula runs away (at 1 rad
+    it overpredicts by 2x). Below s^2 = log(2) there is no solution at all.
+
+    Without `phase_only` the modulation is low-passed complex noise that does
+    not wrap, so the field grain is just the kernel's own autocorrelation.
+    """
+    if not phase_only:
+        return grain_px / _SCREEN_FWHM_PER_SIGMA
+    if rms_rad ** 2 <= np.log(2.0):
+        raise ValueError(
+            f"speckle_grain_m needs a phase rms above {np.sqrt(np.log(2.0)):.2f} rad to be "
+            f"well defined (got speckle={rms_rad:g}): below that the wavefront keeps a "
+            f"coherent component and its correlation never falls to half. Raise `speckle`, "
+            f"or set the kernel width directly with speckle_grain_px."
+        )
+    return grain_px / (4.0 * np.sqrt(-np.log(1.0 - np.log(2.0) / rms_rad ** 2)))
+
+
+def _autocorr_fwhm_px(a):
+    """FWHM of the autocorrelation of `a`, in pixels; nan if it never halves."""
+    a = np.asarray(a)
+    a = a - a.mean()
+    ac = np.fft.fftshift(np.real(np.fft.ifft2(np.abs(np.fft.fft2(a)) ** 2)))
+    peak = ac.max()
+    if peak <= 0:
+        return np.nan
+    line = ac[ac.shape[0] // 2, ac.shape[1] // 2:] / peak
+    below = np.flatnonzero(line < 0.5)
+    if below.size == 0:
+        return np.nan
+    j = below[0]
+    if j == 0:
+        return 0.0
+    return 2.0 * (j - 1 + (line[j - 1] - 0.5) / (line[j - 1] - line[j]))
 
 
 def _hermite_gauss_orders(n):
@@ -227,6 +323,10 @@ def make_probe(
     shift_px=(0.0, 0.0),
     random_phase_rad=0.0,
     random_phase_corr_px=8.0,
+    speckle=0.0,
+    speckle_grain_px=None,
+    speckle_grain_m=None,
+    speckle_phase_only=False,
     seed=0,
     n_modes=1,
     secondary_mode_power=0.02,
@@ -265,6 +365,35 @@ def make_probe(
     random_phase_rad, random_phase_corr_px
         Smooth random phase screen on the aperture -- speckle / partial
         coherence, and it breaks the symmetry that stalls a recon.
+    speckle, speckle_phase_only
+        Granular structure inside the aperture, as if a diffuser sat on it.
+        Without `speckle_phase_only` the diffuser modulates amplitude and
+        `speckle` is how much of it, 0 to 1 -- not the contrast itself, which
+        saturates at fully developed speckle (Rayleigh amplitude, uniform
+        phase) by about 0.7:
+
+            speckle  0.1   0.2   0.3   0.4   0.5   0.7   1.0
+            K        0.18  0.34  0.53  0.72  0.89  0.99  1.00
+
+        so 0.2-0.3 mottles the probe while keeping it beam-shaped. With
+        `speckle_phase_only` the amplitude is left alone -- |field| is exactly
+        the aperture, so a flat-top aperture gives a constant-amplitude
+        wavefront -- and `speckle` is the phase excursion in radians instead.
+        Verbose prints what was actually delivered either way.
+    speckle_grain_px, speckle_grain_m
+        Size of the grains, one or the other, never both. `speckle_grain_px`
+        is the smoothing kernel's sigma in pixels of the plane the aperture is
+        drawn on (with plane="pupil" that is the pupil grid, where finer
+        grains spread the focus further); it defaults to 4.0. `speckle_grain_m`
+        instead asks for a delivered wavefront grain -- the FWHM of the field
+        autocorrelation, the speckle you actually see -- in metres, and solves
+        for the sigma that produces it.
+
+        The two differ once the phase wraps: at speckle = 2*pi a 30 nm
+        wavefront grain comes from a 188 nm screen, so passing 30 nm to
+        `speckle_grain_m` and to `speckle_grain_px / pixel` are very different
+        requests. `speckle_grain_m` needs a phase rms above ~0.83 rad to be
+        well posed, and needs `pixel_size_m`.
     n_modes, secondary_mode_power
         Incoherent modes: Hermite-Gauss modulations of the base field,
         orthonormalized, sharing `secondary_mode_power` of the total power.
@@ -282,6 +411,18 @@ def make_probe(
     needs_lambda = plane == "pupil" or defocus_m or astigmatism_m
     if needs_lambda and (in_pixels or wavelength_m is None):
         raise ValueError("pupil-plane construction and defocus need pixel_size_m and wavelength_m")
+
+    # ---- grain: a kernel sigma in pixels, or a wanted grain in metres ------
+    if speckle_grain_px is not None and speckle_grain_m is not None:
+        raise ValueError("give speckle_grain_px or speckle_grain_m, not both")
+    if speckle_grain_m is not None:
+        if in_pixels:
+            raise ValueError("speckle_grain_m needs pixel_size_m; use speckle_grain_px instead")
+        speckle_grain_px = _speckle_sigma_for_grain(
+            speckle_grain_m / dx, speckle, speckle_phase_only
+        )
+    elif speckle_grain_px is None:
+        speckle_grain_px = 4.0
 
     FX, FY = _grid(size, 1.0 / (size * dx))          # frequency grid, cycles/m
 
@@ -312,6 +453,9 @@ def make_probe(
     if random_phase_rad:
         field = field * np.exp(1j * _smooth_random_phase(size, random_phase_rad,
                                                          random_phase_corr_px, rng))
+    if speckle:
+        field = field * _speckle_modulation(size, speckle, speckle_grain_px, rng,
+                                            speckle_phase_only)
 
     # ---- angular spectrum: defocus, astigmatism, translation --------------
     spectrum = field if plane == "pupil" else _ft(field)
@@ -367,6 +511,46 @@ def make_probe(
             msg.append(f"  defocus {defocus_m * 1e6:+.1f} um, astigmatism "
                        f"{astigmatism_m * 1e6:+.1f} um (angular-spectrum limit "
                        f"|z| < {z_crit * 1e6:.0f} um)")
+        if speckle:
+            where = "pupil" if plane == "pupil" else "sample"
+            msg.append(f"  speckle {'phase ' if speckle_phase_only else ''}{speckle:.2f}, "
+                       f"kernel sigma {speckle_grain_px:.2f} px on the {where} plane "
+                       f"(screen {_SCREEN_FWHM_PER_SIGMA * speckle_grain_px:.1f} px"
+                       + ("" if in_pixels else
+                          f" = {_SCREEN_FWHM_PER_SIGMA * speckle_grain_px * dx * 1e9:.0f} nm")
+                       + ")")
+            # Both diagnostics only make sense where the probe is still on the
+            # plane the grains were drawn on. Focus or propagate and the grain
+            # is reset by the aperture size, not by the kernel.
+            if plane == "sample" and not (defocus_m or astigmatism_m):
+                # The delivered grain: FWHM of the field autocorrelation. This
+                # is the speckle you see, and once the phase wraps it is much
+                # finer than the screen printed above.
+                grain = _autocorr_fwhm_px(np.real(modes[0, 0]))
+                if np.isfinite(grain) and grain > 0:
+                    got = f"  grain {grain:.2f} px"
+                    if not in_pixels:
+                        got += f" = {grain * dx * 1e9:.1f} nm"
+                    if grain < 2.0:
+                        got += (f"  -- UNDER-SAMPLED, a grain needs >= 2 px "
+                                f"({2 * dx * 1e9:.1f} nm at this pixel); it will alias")
+                    msg.append(got)
+                # Amplitude contrast is only a thing in blend mode; phase_only
+                # leaves |field| equal to the aperture by construction, so the
+                # only spread left would be the rim.
+                #
+                # The support has to come from the blurred envelope: thresholding
+                # the speckled intensity itself keeps only the brightest grains
+                # and reports a contrast near zero. Six grains of blur averages
+                # the grains away and leaves the aperture shape; the cap stops
+                # that blurring past the aperture itself.
+                if not speckle_phase_only:
+                    inten = np.abs(modes[0, 0]) ** 2
+                    env = _smooth(inten, min(max(6 * speckle_grain_px, 3.0), size / 16))
+                    lit = inten[env > 0.5 * env.max()]
+                    if lit.size >= 100:
+                        msg.append(f"  intensity contrast {lit.std() / lit.mean():.2f} "
+                                   f"over the lit area")
         prof = (np.abs(modes[0, 0]) ** 2).sum(axis=0)
         coord = (np.arange(size) - size // 2) * dx * to_um
         msg.append(f"  mode 0 FWHM ~ {_fwhm(coord, prof):.4g} {unit} (x, summed over y)")
@@ -384,6 +568,85 @@ def make_disk_probe(size, diameter_px, **kwargs):
     kwargs.setdefault("verbose", False)
     kwargs.setdefault("power", None)
     return make_probe(size, kind="disk", diameter=diameter_px, **kwargs)
+
+
+def _square_mode_orders(n_modes):
+    """(a, b) exponent pairs in square order: (0,0), (1,0), (0,1), (1,1), ...
+
+    Sorted by (max(a, b), a + b, a), so the two dipoles come before the
+    quadrupole. Pty-Chi instead walks a rectangular grid sized
+    m = ceil(sqrt(n)) - 1, n = ceil(n / (m + 1)) - 1, which at 5 modes gives
+    (0,0), u, u^2, v, uv -- the second dipole is pushed to index 3 and u^2
+    lands at index 2.
+    """
+    k = int(np.ceil(np.sqrt(n_modes))) + 1
+    pairs = [(a, b) for a in range(k) for b in range(k)]
+    return sorted(pairs, key=lambda p: (max(p), p[0] + p[1], p[0]))[:n_modes]
+
+
+def hermite_secondary_modes(probe, secondary_mode_energy=0.02, rotation_deg=0.0):
+    """Fill incoherent modes 1.. with Hermite-Gauss modulations of mode 0.
+
+    Drop-in for Pty-Chi's `orthogonalize_initial_probe`: takes an
+    (n_opr, n_modes, h, w) tensor, uses probe[0, 0] as the source, overwrites
+    probe[0, 1:], and normalizes each mode to its share of mode 0's energy.
+    Two differences, both needed to start from the mode basis a measured probe
+    actually has:
+
+      * modes are walked in square order (see `_square_mode_orders`), so the
+        ladder is dipole, dipole, quadrupole rather than dipole, u^2, dipole;
+      * `rotation_deg` turns the basis, so the lobes can split along the
+        diagonals instead of the axes.
+
+    `secondary_mode_energy` is the energy of EACH secondary mode, not the
+    total, matching Pty-Chi: mode 0 keeps 1 - (n_modes - 1) * that.
+
+    Note this only sets the *initial* modes. With
+    `probe_options.orthogonalize_incoherent_modes` enabled the reconstructor
+    re-orthogonalizes by SVD every few epochs, and the data reshapes them.
+    """
+    is_tensor = torch.is_tensor(probe)
+    p = probe.detach().cpu().numpy().copy() if is_tensor else np.array(probe, copy=True)
+    n_modes = p.shape[1]
+    psi = p[0, 0]
+    if n_modes < 2:
+        return probe
+
+    h, w = psi.shape
+    x = np.arange(w) - w / 2 + 1                  # Pty-Chi's centring
+    y = np.arange(h) - h / 2 + 1
+    xx, yy = np.meshgrid(x, y, indexing="xy")
+    inten = np.abs(psi) ** 2
+    total = inten.sum()
+    X = xx - (xx * inten).sum() / total
+    Y = yy - (yy * inten).sum() / total
+
+    t = np.deg2rad(rotation_deg)
+    U = X * np.cos(t) + Y * np.sin(t)
+    V = -X * np.sin(t) + Y * np.cos(t)
+    var_u = (U**2 * inten).sum() / total
+    var_v = (V**2 * inten).sum() / total
+    damp = np.exp(-(U**2 / (2 * var_u)) - (V**2 / (2 * var_v)))
+
+    basis = []
+    for i, (a, b) in enumerate(_square_mode_orders(n_modes)):
+        f = (U**a) * (V**b) * psi
+        if i > 0:
+            f = f * damp
+        f = f / np.sqrt(max((np.abs(f) ** 2).sum(), 1e-300))
+        for g in basis:                           # Gram-Schmidt, as Pty-Chi does
+            f = f - g * (g * f.conj()).sum()
+        basis.append(f / np.sqrt(max((np.abs(f) ** 2).sum(), 1e-300)))
+
+    energies = np.full(n_modes, secondary_mode_energy, dtype=np.float64)
+    energies[0] = 1.0 - secondary_mode_energy * (n_modes - 1)
+    energies = energies * total
+    for i, f in enumerate(basis):
+        p[0, i] = f * np.sqrt(energies[i] / max((np.abs(f) ** 2).sum(), 1e-300))
+
+    if is_tensor:
+        return torch.as_tensor(p, dtype=probe.dtype, device=probe.device)
+    return p
 
 
 def show_probe(probe, pixel_size_m=None, mode=0, opr=0, cmap="inferno",
@@ -655,14 +918,33 @@ def show_ptychogram_grid(patterns, n_show=16, log=True, cmap="inferno", transpos
 #       recon_Niter200.h5  recon_Niter400.h5  ...
 #       loss/  object_mag/  object_ph/  positions/  probe_mag/
 #
-# In the reconstruction scripts these knobs are module-level variables, so both
-# make_recon_dir_name() and collect_params() take a `cfg` namespace and are
-# normally called as `make_recon_dir_name(globals())`. A dict, a SimpleNamespace
-# or any object with the attributes works too, and keyword arguments override
-# whatever comes out of it.
+# In the reconstruction scripts these knobs are module-level variables, so the
+# four functions below read them from a `cfg` namespace that defaults to the
+# globals of whatever called them. Run cell-by-cell in an interactive window
+# that is the notebook namespace, so `make_recon_dir_name(recon_dir_suffix)`
+# and `save_initial_conditions(recon_dir)` just work, exactly as they do in
+# 4idd_202603/ptychi_reconstruction_4idd.py where these were local functions.
+#
+# Pass the namespace explicitly -- `make_recon_dir_name(globals(), "_v2")` -- to
+# call them from inside another function, where the caller's globals are the
+# defining module's and not the knobs. A dict, a SimpleNamespace or any object
+# with the attributes works, and keyword arguments override whatever it holds.
 # ---------------------------------------------------------------------------
 
 _MISSING = object()
+
+
+def _caller_globals(depth=2):
+    """Module globals of the frame `depth` levels up (2 = our caller's caller)."""
+    frame = inspect.currentframe()
+    try:
+        for _ in range(depth):
+            if frame.f_back is None:
+                break
+            frame = frame.f_back
+        return frame.f_globals
+    finally:
+        del frame
 
 
 def _lookup(cfg, name, default=_MISSING):
@@ -680,6 +962,33 @@ def _lookup(cfg, name, default=_MISSING):
 def _enum_value(x):
     """api.BatchingModes.COMPACT -> 'compact'; a plain string passes through."""
     return getattr(x, "value", x)
+
+
+def _jsonable(x):
+    """Plain JSON types out of the objects the scripts actually hold knobs in.
+
+    Values read straight out of the para file are 0-d numpy arrays rather than
+    Python floats -- `energy` and `detector_distance` come back from h5py as
+    `np.asarray(...).squeeze()` -- and paths are `Path`. json.dump chokes on
+    both, so everything going into pear_params.json passes through here.
+    """
+    if isinstance(x, Path):
+        return str(x)
+    if isinstance(x, np.bool_):
+        return bool(x)
+    if isinstance(x, np.integer):
+        return int(x)
+    if isinstance(x, np.floating):
+        return float(x)
+    if isinstance(x, np.ndarray):
+        return _jsonable(x.item()) if x.ndim == 0 else [_jsonable(v) for v in x.tolist()]
+    if torch.is_tensor(x):
+        return _jsonable(x.detach().cpu().numpy())
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    return _enum_value(x)
 
 
 def rgb_uint8(arr, cmap="gray", log=False):
@@ -707,8 +1016,18 @@ def make_recon_dir_name(cfg=None, suffix="", **knobs):
     updated with the higher probe modes, opr<n>, ic = intensity correction,
     pc0/pc1 = position correction, gradient method initial, ul<update limit>.
 
-    Knobs come from `cfg` (pass `globals()`) unless given as keywords.
+    Knobs come from `cfg`, which defaults to the caller's globals, unless given
+    as keywords. A bare string first argument is taken as the suffix, so both
+    `make_recon_dir_name("_v2")` and `make_recon_dir_name(globals(), "_v2")`
+    do the same thing.
     """
+    if isinstance(cfg, str):
+        if suffix:
+            raise TypeError("suffix given both positionally and as a keyword")
+        cfg, suffix = None, cfg
+    if cfg is None:
+        cfg = _caller_globals()
+
     def k(name, default=_MISSING):
         return knobs[name] if name in knobs else _lookup(cfg, name, default)
 
@@ -739,11 +1058,14 @@ def make_recon_dir_name(cfg=None, suffix="", **knobs):
 def collect_params(cfg=None, **overrides):
     """The knob dump written to pear_params.json, keyed like PEAR's params.
 
-    Script variables are read from `cfg` (pass `globals()`); `overrides` are
-    keyed by PEAR name and win over it. Anything absent from both falls back to
-    the default listed below, so a script that does not define, say,
-    `probe_propagation_m` still gets a valid file.
+    Script variables are read from `cfg`, which defaults to the caller's
+    globals; `overrides` are keyed by PEAR name and win over it. Anything absent
+    from both falls back to the default listed below, so a script that does not
+    define, say, `probe_propagation_m` still gets a valid file.
     """
+    if cfg is None:
+        cfg = _caller_globals()
+
     def k(name, default=_MISSING):
         return _lookup(cfg, name, default)
 
@@ -791,22 +1113,38 @@ def collect_params(cfg=None, **overrides):
     if unknown:
         raise KeyError(f"unknown pear_params key(s): {sorted(unknown)}")
     params.update(overrides)
-    return params
+    return {key: _jsonable(value) for key, value in params.items()}
 
 
-def save_initial_conditions(recon_dir, params, patterns, probe, positions_px):
+def save_initial_conditions(recon_dir, params=None, patterns=None, probe=None,
+                            positions_px=None, cfg=None):
     """Write pear_params.json and the dp_sum / init_probe / init_positions previews.
 
     `probe` is the initial guess in any of the shapes the scripts hold it in --
     (h, w), (n_modes, h, w) or (n_opr, n_modes, h, w) -- torch or numpy.
+
+    Everything but `recon_dir` defaults to the same-named variable in `cfg`,
+    which itself defaults to the caller's globals, so from a reconstruction
+    script this is just `save_initial_conditions(recon_dir)`. `params` defaults
+    to `collect_params()` over that same namespace.
     """
     if tifffile is None:
         raise ImportError("tifffile is needed for the *.tiff previews")
+    if cfg is None:
+        cfg = _caller_globals()
+    if params is None:
+        params = collect_params(cfg)
+    if patterns is None:
+        patterns = _lookup(cfg, "patterns")
+    if probe is None:
+        probe = _lookup(cfg, "probe")
+    if positions_px is None:
+        positions_px = _lookup(cfg, "positions_px")
     recon_dir = Path(recon_dir)
     recon_dir.mkdir(parents=True, exist_ok=True)
 
     with open(recon_dir / "pear_params.json", "w") as f:
-        json.dump(params, f, indent=4)
+        json.dump(params, f, indent=4, default=_jsonable)
 
     tifffile.imwrite(recon_dir / "dp_sum.tiff", rgb_uint8(np.asarray(patterns).sum(0), log=True))
 
@@ -834,13 +1172,17 @@ def save_initial_conditions(recon_dir, params, patterns, probe, positions_px):
 _affine_history = {}
 
 
-def save_reconstruction(task, recon_dir, pixel_size_m, n_iter=None, affine_history=None):
+def save_reconstruction(task, recon_dir, n_iter=None, *, pixel_size_m=None,
+                        affine_history=None, cfg=None):
     """Write recon_Niter{n_iter}.h5 plus previews, matching the beamline files.
 
     `n_iter` defaults to the number of epochs the task has actually run, so this
     can be called straight after a hand-issued task.run(n) without tracking the
-    count yourself. `affine_history` is the dict the position-correction
-    components accumulate into; the default keeps one per `recon_dir`.
+    count yourself. `pixel_size_m` is keyword-only -- it can never swallow a
+    positional epoch count -- and defaults to the variable of that name in
+    `cfg`, itself defaulting to the caller's globals. `affine_history` is the
+    dict the position-correction components accumulate into; the default keeps
+    one per `recon_dir`.
 
     Datasets (identical names, shapes and dtypes to PEAR's recon_Niter*.h5, so
     these results can be fed straight back in through `init_recon_file`):
@@ -857,6 +1199,8 @@ def save_reconstruction(task, recon_dir, pixel_size_m, n_iter=None, affine_histo
     """
     if tifffile is None:
         raise ImportError("tifffile is needed for the *.tiff previews")
+    if pixel_size_m is None:
+        pixel_size_m = _lookup(cfg if cfg is not None else _caller_globals(), "pixel_size_m")
     recon_dir = Path(recon_dir)
     recon_dir.mkdir(parents=True, exist_ok=True)
     if affine_history is None:

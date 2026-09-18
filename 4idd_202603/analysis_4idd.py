@@ -8,32 +8,32 @@ import matplotlib.pyplot as plt
 
 recon_fly520_iter1000 = Path(
     "/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/fly520"
-    "/Ndp256_LSQML_c250_m0.25_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter1000_deramped.h5"
+    "/Ndp256_LSQML_c500_m0.5_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter1000_deramped.h5"
 )
 
 recon_fly520_iter1500 = Path(
     "/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/fly520"
-    "/Ndp256_LSQML_c250_m0.25_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter1500_deramped.h5"
+    "/Ndp256_LSQML_c500_m0.5_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter1500_deramped.h5"
 )
 
 recon_fly520_iter2000 = Path(
     "/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/fly520"
-    "/Ndp256_LSQML_c250_m0.25_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter2000_deramped.h5"
+    "/Ndp256_LSQML_c500_m0.5_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter2000_deramped.h5"
 )
 
 recon_fly521_iter1000 = Path(
     "/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/fly521"
-    "/Ndp256_LSQML_c250_m0.25_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter1000_deramped.h5"
+    "/Ndp256_LSQML_c500_m0.5_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter1000_deramped.h5"
 )
 
 recon_fly521_iter1500 = Path(
     "/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/fly521"
-    "/Ndp256_LSQML_c250_m0.25_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter1500_deramped.h5"
+    "/Ndp256_LSQML_c500_m0.5_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter1500_deramped.h5"
 )
 
 recon_fly521_iter2000 = Path(
     "/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/fly521"
-    "/Ndp256_LSQML_c250_m0.25_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter2000_deramped.h5"
+    "/Ndp256_LSQML_c500_m0.5_gaussian_p10_mm_opr1_pc1_f_ul20/recon_Niter2000_deramped.h5"
 )
 
 #%% ------------------------------------------------- fly521 - fly520 difference
