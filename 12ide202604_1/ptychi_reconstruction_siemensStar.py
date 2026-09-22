@@ -12,8 +12,8 @@
 #   params.momentumAcceleration    -> reconstructor_options.momentum_acceleration_gain
 #   params.positionCorrectionSwitch-> probe_position_options.optimizable
 
-from utils import use_inline_backend
-use_inline_backend()             # Plot Viewer-compatible backend, in its own cell
+# from utils import use_inline_backend
+# use_inline_backend()             # Plot Viewer-compatible backend, in its own cell
 
 
 import os
@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from utils import center_crop_or_pad,show_ptychogram,make_probe,hermite_secondary_modes
+# from utils import center_crop_or_pad,show_ptychogram,make_probe,hermite_secondary_modes
 
 import ptychi.api as api
 from ptychi.api.options.base import OptimizationPlan
@@ -47,7 +47,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 scan = "S0019"
 scan_initialGuess = "S0019"  # scan used to generate the initial guess (positions + probe)
-data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test")
+# On the beamline (Linux) the shares are /mnt/micdata2 and /mnt/micdata3;
+# here on Windows the same shares are \\micdata\data2 and \\micdata\data3.
+# data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test")
+data_root = Path(r"\\micdata\data2\12IDC\2026_Data\2026_3\01_piezo_test")
 
 dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.hdf5"
 para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
@@ -62,7 +65,8 @@ init_recon_file = (
 
 # init_recon_file = None
 
-out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
+# out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
+out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
 recon_dir_suffix = "_edgeK200_detMask_0mode_objinit"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
