@@ -17,7 +17,7 @@
 
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # This makes GPU N appear as GPU 0 to CuPy
+os.environ["CUDA_VISIBLE_DEVICES"] = "8"  # This makes GPU N appear as GPU 0 to CuPy
 
 import logging
 from pathlib import Path
@@ -397,9 +397,9 @@ obj = torch.as_tensor(
 print(f"object buffer: {tuple(obj.shape)}")
 
 fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-axes[0].imshow(np.abs(obj[0].numpy()), cmap="inferno")
+axes[0].imshow(np.abs(obj[0].numpy()), cmap="gray")
 axes[0].set_title("initial object magnitude")
-axes[1].imshow(np.angle(obj[0].numpy()), cmap="inferno")
+axes[1].imshow(np.angle(obj[0].numpy()), cmap="gray")
 axes[1].set_title("initial object phase")
 for ax in axes:
     ax.set_aspect("equal")
