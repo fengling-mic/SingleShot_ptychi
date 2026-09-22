@@ -17,7 +17,7 @@ use_inline_backend()             # Plot Viewer-compatible backend, in its own ce
 
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # This makes GPU N appear as GPU 0 to CuPy
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # This makes GPU N appear as GPU 0 to CuPy
 
 import logging
 from pathlib import Path
