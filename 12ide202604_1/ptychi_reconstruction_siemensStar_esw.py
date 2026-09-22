@@ -49,8 +49,8 @@ scan = "S0019"
 scan_initialGuess = "S0019"  # scan used to generate the initial guess (positions + probe)
 # On the beamline (Linux) the shares are /mnt/micdata2 and /mnt/micdata3;
 # here on Windows the same shares are \\micdata\data2 and \\micdata\data3.
-# data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test")
-data_root = Path(r"\\micdata\data2\12IDC\2026_Data\2026_3\01_piezo_test")
+data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test")
+# data_root = Path(r"\\micdata\data2\12IDC\2026_Data\2026_3\01_piezo_test")
 
 dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.hdf5"
 para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
@@ -65,9 +65,9 @@ init_recon_file = (
 
 # init_recon_file = None
 
-# out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
-out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_edgeK200_objinit_objk100"            # appended to the folder name, e.g. "_v2" or "_pos"
+out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
+# out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
+recon_dir_suffix = "_edgeK200_start10"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -129,16 +129,16 @@ probe_mode_rotation_deg = 38.0
 
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
-num_epochs = 500
-save_freq_iterations = 5000       # write a recon_Niter*.h5 snapshot every N epochs
+num_epochs = 1500
+save_freq_iterations = 500       # write a recon_Niter*.h5 snapshot every N epochs
 batch_size = 100                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
-noise_model = api.NoiseModels.POISSON
-momentum_gain = 0.25              # fracPy params.momentumAcceleration
+noise_model = api.NoiseModels.GAUSSIAN  # fracPy params.noiseModel
+momentum_gain = 0              # fracPy params.momentumAcceleration
 
-probe_start = 100                  # epoch at which the probe starts updating
+probe_start = 10                  # epoch at which the probe starts updating
 opr_start = 10                   # None disables OPR weight optimization
-position_start = 10              # None disables position correction (fracPy pcPIE)
+position_start = None              # None disables position correction (fracPy pcPIE)
 orthogonalization_stride = 5     # fracPy params.orthogonalizationFrequency
 position_update_limit_px = 20.0
 optimize_intensity_variation = False   # per-position beam intensity ("ic")
@@ -312,7 +312,7 @@ elif probe.shape[1] < n_probe_modes:
     # ladder is dipole, dipole, quadrupole like the reference, and with the
     # basis rotated onto the diagonals.
     probe = hermite_secondary_modes(
-        padded, secondary_mode_energy=0, rotation_deg=probe_mode_rotation_deg
+        padded, secondary_mode_energy=0.05, rotation_deg=probe_mode_rotation_deg
     )
 
 # OPR modes.
@@ -335,66 +335,107 @@ print(f"probe: {tuple(probe.shape)} (n_opr, n_modes, h, w)")
 
 #%% ---------------------------------------------------------------- initial object
 
+# PRL-style per-position ESW estimate: Williams et al., "Fresnel Coherent Diffractive
+# Imaging," Phys. Rev. Lett. 97, 025506 (2006), Eq. (3). At each position, iterate
+#
+#     rho_{k+1} = F^-1[ M( F[rho_k] + Psi_inc ) - Psi_inc ]
+#
+# where rho = T.psi_inc is the object-induced perturbation of the exit wave (rho_0 = 0,
+# i.e. "no object yet"), Psi_inc = F[psi_inc] is the known illumination's own far field
+# (precomputed once), and M enforces the measured modulus at valid detector pixels,
+# leaving the current estimate alone at dead/stuck pixels (same `valid_pixel_mask`
+# convention used for the probe's own GS fit above). Unlike a single Wiener division,
+# this iterates the actual modulus constraint against the measured data at every
+# position, so it isn't limited to a weak-object approximation.
+#
+# CAVEAT: this omits the paper's real-space support constraint (pi_s in their Eq. 1/3).
+# Their support -- the isolated gold sample surrounded by vacuum -- is what gave plain ER
+# its resistance to the twin image and its clean, ~30-iteration convergence. The Siemens
+# star fills the field of view with no equivalent vacuum region, so there's nothing
+# physically correct to threshold to zero, and this was deliberately run without one on
+# request. What's left is the known-illumination modulus trick alone -- still legitimate,
+# since the paper credits the curved/structured illumination itself (not the support)
+# with making the solution unique -- but expect noisier, slower, less certain convergence
+# per position than the paper reports, and no protection against stagnation or the twin
+# image.
+#
+# Positions are processed independently (no overlap redundancy shared during the ER
+# iterations themselves), then combined afterward with the same |P|^2-weighted stitch
+# `seed_object` used in the non-ESW script. Runs batched in Torch on GPU since
+# n_iterations x n_positions x 2 FFTs of size n_dp^2 is too slow as a per-position NumPy
+# loop.
+def esw_object_prl(
+    patterns, probe_2d, positions_px, object_shape, valid_pixel_mask,
+    n_iterations=100, batch_size=32, verbose=True,
+):
+    """Per-position ESW estimate via known-illumination ER (no support constraint)."""
+    torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+    P = torch.as_tensor(np.asarray(probe_2d, dtype=np.complex64), device=torch_device)
+    n = P.shape[-1]
+    Psi_inc = torch.fft.fft2(P)  # illumination's own far field, precomputed once
+    keep = torch.as_tensor(np.fft.ifftshift(valid_pixel_mask), device=torch_device)
+
+    p_conj = torch.conj(P)
+    p_sq = P.abs() ** 2
+    eps = 1e-3 * p_sq.max()
+    cy, cx = object_shape[0] // 2, object_shape[1] // 2
+
+    num = torch.zeros(object_shape, dtype=torch.complex64, device=torch_device)
+    den = torch.zeros(object_shape, dtype=torch.float32, device=torch_device)
+
+    n_pos = len(positions_px)
+    err_num, err_den = 0.0, 0.0
+    for start in range(0, n_pos, batch_size):
+        sl = slice(start, start + batch_size)
+        batch_patterns = np.fft.ifftshift(patterns[sl], axes=(-2, -1)).astype(np.float32)
+        target_amp = torch.sqrt(
+            torch.clamp(torch.as_tensor(batch_patterns, device=torch_device), min=0)
+        )
+        b = target_amp.shape[0]
+        rho = torch.zeros((b, n, n), dtype=torch.complex64, device=torch_device)
+
+        for _ in range(n_iterations):
+            far = torch.fft.fft2(rho) + Psi_inc  # (i) propagate, (ii) add illumination
+            amp = far.abs()
+            corrected = torch.where(
+                amp > 1e-12, target_amp * far / amp, target_amp.to(far.dtype)
+            )
+            far = torch.where(keep, corrected, far)  # (iii) modulus at valid pixels only
+            rho = torch.fft.ifft2(far - Psi_inc)      # (iv) subtract illum., (v) backpropagate
+
+        # Track a chi^2-like relative modulus error (paper's Eq. 2) for convergence sanity.
+        far_final = (torch.fft.fft2(rho) + Psi_inc).abs()
+        err_num += (((far_final - target_amp) ** 2) * keep).sum().item()
+        err_den += ((target_amp ** 2) * keep).sum().item()
+
+        pos_batch = positions_px[sl]
+        for i in range(b):
+            pos_y, pos_x = pos_batch[i]
+            r0 = int(round(cy + pos_y - n / 2))
+            c0 = int(round(cx + pos_x - n / 2))
+            num[r0 : r0 + n, c0 : c0 + n] += rho[i] * p_conj
+            den[r0 : r0 + n, c0 : c0 + n] += p_sq
+
+    if verbose:
+        print(f"ESW/PRL seed: relative modulus chi^2 after {n_iterations} iters "
+              f"= {err_num / err_den:.4e}")
+
+    est = num / (den + eps)
+    lit = den > 0.01 * den.max()
+    est = est / torch.median(est[lit].abs())
+    est = torch.where(lit, est, torch.ones_like(est))
+    return est.cpu().numpy().astype(np.complex64)
+
+
 object_shape = get_suggested_object_size(positions_px, probe.shape[-2:], extra=object_padding_px)
 # obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
 # obj = torch.full((1, *object_shape), 1j, dtype=get_default_complex_dtype())
 
-# Seed the object from the patterns instead of starting flat. The data give
-# |FFT(P.O)| but not its phase; under the weak-object approximation the exit wave's
-# far field is dominated by the probe's, so seed the missing phase with the probe's
-# own and invert:
-#
-#     psi_j = IFFT( sqrt(I_j) . exp(i . angle(FFT(P))) )
-#     O_j   = psi_j . conj(P) / (|P|^2 + eps)
-#
-# The divide has to be Wiener-regularised because P is zero over most of the array,
-# and the per-position patches are stitched with the same |P|^2 weight the
-# reconstructor uses as its preconditioner.
-#
-# The seed is only as good as the probe it is given. Scored against the converged
-# reference object it reaches corr 0.75 when fed that converged probe, but 0.02 when
-# fed the synthesized speckle probe, whose far-field phase is unrelated to the real
-# beam -- so this earns its keep when init_recon_file supplies a real probe, and
-# does nothing for a synthesized one. Uncomment a line above to go back to flat.
-def seed_object(patterns, probe_2d, positions_px, object_shape, valid_pixel_mask):
-    """Weak-object estimate of the object from the patterns and a known probe."""
-    P = np.asarray(probe_2d, dtype=np.complex64)
-    n = P.shape[-1]
-    p_hat = np.fft.fft2(P)
-    seed_phase = np.exp(1j * np.angle(p_hat))
-    # At dead detector pixels there is no measurement; the model's own amplitude is
-    # the best stand-in and keeps the module gaps out of the seeded object.
-    amp_model = np.abs(p_hat)
-    keep = np.fft.ifftshift(valid_pixel_mask)
-
-    p_conj = np.conj(P)
-    p_sq = np.abs(P) ** 2
-    eps = 1e-3 * p_sq.max()
-    cy, cx = object_shape[0] // 2, object_shape[1] // 2
-
-    num = np.zeros(object_shape, dtype=np.complex64)
-    den = np.zeros(object_shape, dtype=np.float32)
-    for (pos_y, pos_x), pattern in zip(positions_px, patterns):
-        amp = np.where(keep, np.sqrt(np.fft.ifftshift(pattern)), amp_model)
-        psi = np.fft.ifft2(amp * seed_phase)
-        r0 = int(round(cy + pos_y - n / 2))
-        c0 = int(round(cx + pos_x - n / 2))
-        num[r0 : r0 + n, c0 : c0 + n] += psi * p_conj
-        den[r0 : r0 + n, c0 : c0 + n] += p_sq
-
-    est = num / (den + eps)
-    lit = den > 0.01 * den.max()
-    est = est / np.median(np.abs(est[lit]))   # mean transmission ~ 1, as for ones
-    return np.where(lit, est, 1.0).astype(np.complex64)   # unlit buffer stays clear
-
-
 obj = torch.as_tensor(
-    seed_object(patterns, probe[0, 0].numpy(), positions_px, object_shape,
-                valid_pixel_mask)[None],
+    esw_object_prl(patterns, probe[0, 0].numpy(), positions_px, object_shape,
+                   valid_pixel_mask)[None],
     dtype=get_default_complex_dtype(),
 )  # (n_slices, h, w)
-
-print(f"object buffer: {tuple(obj.shape)}")
 
 fig, axes = plt.subplots(1, 2, figsize=(8, 4))
 axes[0].imshow(np.abs(obj[0].numpy()), cmap="gray")
@@ -442,28 +483,23 @@ options.object_options.build_preconditioner_with_all_modes = True
 options.object_options.determine_position_origin_coords_by = (
     api.ObjectPosOriginCoordsMethods.SUPPORT
 )
-# fracPy object constraints (all off in the source script):
-# options.object_options.l2_norm_constraint.enabled = True
-# options.object_options.l2_norm_constraint.weight = 1e-3
-# options.object_options.smoothness_constraint.enabled = True
-# options.object_options.smoothness_constraint.alpha = 0.05
 
 # object constrain in the Fourier space
-options.object_options.fourier_support_constraint.enabled = True
+options.object_options.fourier_support_constraint.enabled = False
 options.object_options.fourier_support_constraint.optimization_plan = (
-    OptimizationPlan(start=0, stride=1)
+    OptimizationPlan(start=200, stride=1)
 )
 # Absolute cutoff in FFT bins of the object buffer. Takes priority over the ratio
 # below; set it to None to fall back to the ratio. Note the object buffer is sized
 # per scan, so a fixed bin radius drifts in physical frequency between scans.
-options.object_options.fourier_support_constraint.radius_px = 100
+options.object_options.fourier_support_constraint.radius_px = 50
 # Used only when radius_px is None: ko / kp in cycles/m against the probe cutoff.
 options.object_options.fourier_support_constraint.radius_ratio_to_probe = 0.5
 
 # --- probe ---
 options.probe_options.optimizable = True
 options.probe_options.optimizer = api.Optimizers.SGD
-options.probe_options.step_size = 1.0
+options.probe_options.step_size = 0.3
 options.probe_options.optimization_plan = OptimizationPlan(start=probe_start)
 options.probe_options.orthogonalize_incoherent_modes.enabled = n_probe_modes > 1
 options.probe_options.orthogonalize_incoherent_modes.optimization_plan = OptimizationPlan(
