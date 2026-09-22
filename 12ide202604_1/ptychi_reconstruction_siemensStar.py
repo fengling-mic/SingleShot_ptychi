@@ -55,15 +55,15 @@ para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
 # Previous Pty-Chi recon used as the source of positions and of the probe guess
 # (same file the fracPy script read). Set to None to start from the para file
 # positions and a synthesized probe instead.
-# init_recon_file = (
-#     data_root / "ptychi_recons" / scan_initialGuess
-#     / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
-# )
+init_recon_file = (
+    data_root / "ptychi_recons" / scan_initialGuess
+    / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
+)
 
-init_recon_file = None
+# init_recon_file = None
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
-recon_dir_suffix = ""            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_edgeK200_detMask_0mode_objinit"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -125,7 +125,7 @@ probe_mode_rotation_deg = 38.0
 
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
-num_epochs = 300
+num_epochs = 500
 save_freq_iterations = 5000       # write a recon_Niter*.h5 snapshot every N epochs
 batch_size = 100                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
@@ -170,6 +170,28 @@ np.clip(patterns, 0, None, out=patterns)
 
 print(f"ptychogram: {patterns.shape}, total counts {patterns.sum():.3e}")
 
+# Detector mask. Two classes of pixel carry no measurement and must be kept out of
+# the likelihood instead of being fit as data:
+#
+#   dead  -- the Pilatus module gaps, a hard zero in every frame (21% of the array,
+#            including ~4300 px inside r=128 where 98% of the counts land). Left
+#            unmasked these assert "no scattered intensity here", which is false.
+#   stuck -- pixels reporting the identical count in all frames, so no Poisson
+#            variation: a detector defect, not photons. In S0019 this is
+#            (921, 532) and (921, 533) at 5021 counts/frame each -- 4.5x the
+#            brightest genuine pixel in a frame, sitting at r=409 where the beam
+#            has no real signal. The probe grows a spurious high-angle lobe
+#            trying to explain them.
+frame_sum = patterns.sum(axis=0)
+dead_pixels = frame_sum == 0
+stuck_pixels = (patterns.std(axis=0) == 0) & (frame_sum > 0)
+valid_pixel_mask = ~(dead_pixels | stuck_pixels)
+print(
+    f"detector mask: {dead_pixels.sum()} dead + {stuck_pixels.sum()} stuck "
+    f"-> {100 * valid_pixel_mask.mean():.2f}% valid, "
+    f"{100 * frame_sum[valid_pixel_mask].sum() / frame_sum.sum():.3f}% of counts kept"
+)
+
 # show_ptychogram(patterns, interactive=True)
 
 #%% ---------------------------------------------------------------- positions + prior probe/object
@@ -178,8 +200,8 @@ prior = {}
 if init_recon_file is not None:
     with h5py.File(init_recon_file, "r") as f:
         print(f"keys in {init_recon_file.name}: {list(f.keys())}")
-        prior["object"] = np.asarray(f["object"][()]).view(np.complex64)
-        prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
+        # prior["object"] = np.asarray(f["object"][()]).view(np.complex64)
+        # prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
         prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
 
 if "positions_px" in prior:
@@ -234,8 +256,41 @@ else:
         speckle_phase_only=probe_speckle_phase_only, seed=probe_speckle_seed,
         verbose=True,
     )
+
+    # make_probe builds a filled disc, so its far field is a filled blob peaking at
+    # r=12 with 10.3% of the power inside r<20. The real beam is a zone-plate annulus
+    # peaking at r=36 with 0.24% in the central stop's shadow -- 43x less. Left alone
+    # the reconstruction has to dig all that out of the stop region first.
+    #
+    # Fix it with Gerchberg-Saxton against the measured illumination: a low percentile
+    # across positions keeps what every frame has in common (the beam) and suppresses
+    # the position-dependent object scatter. Alternate imposing that amplitude in the
+    # far field with make_probe's own real-space envelope, so the probe stays the one
+    # you built -- only its far-field amplitude is corrected, from your own data.
+    # Measured result: peak radius 12 -> 36 and 0.1028 -> 0.0024 inside r<20, both
+    # matching the data exactly. Scale is irrelevant here, rescale_probe follows.
+    #
+    # Note this fixes the far-field AMPLITUDE only. The far-field PHASE stays
+    # arbitrary -- GS converges to some field consistent with both amplitudes, not to
+    # your beam's actual speckle phase, which only a reconstruction recovers.
+    gs_iterations = 200
+    _ff_amp = np.sqrt(np.fft.ifftshift(np.percentile(patterns, 10, axis=0)))
+    _measured = np.fft.ifftshift(valid_pixel_mask)   # no measurement at dead pixels
+    _p = np.asarray(probe_init, dtype=np.complex64)
+    _flat = _p.reshape(-1, n_dp, n_dp)
+    for _i in range(_flat.shape[0]):
+        _mode = _flat[_i]
+        _envelope = np.abs(_mode) > 0.01 * np.abs(_mode).max()
+        for _ in range(gs_iterations):
+            _far = np.fft.fft2(_mode)
+            _far = np.where(_measured, _ff_amp * np.exp(1j * np.angle(_far)), _far)
+            _mode = np.fft.ifft2(_far) * _envelope
+        _flat[_i] = _mode
+    probe_init = _flat.reshape(_p.shape)
+
     probe = torch.as_tensor(probe_init,dtype=get_default_complex_dtype(),)
-    print(f"synthesized {probe_init_type} probe, diameter {probe_diameter_m * 1e6:.2f} um")
+    print(f"synthesized {probe_init_type} probe, diameter {probe_diameter_m * 1e6:.2f} um, "
+          f"far field matched to the data in {gs_iterations} GS iterations")
 
 # Incoherent modes: keep what we have, fill the rest with Hermite modes.
 if probe.shape[1] > n_probe_modes:
@@ -253,7 +308,7 @@ elif probe.shape[1] < n_probe_modes:
     # ladder is dipole, dipole, quadrupole like the reference, and with the
     # basis rotated onto the diagonals.
     probe = hermite_secondary_modes(
-        padded, secondary_mode_energy=0.0575, rotation_deg=probe_mode_rotation_deg
+        padded, secondary_mode_energy=0, rotation_deg=probe_mode_rotation_deg
     )
 
 # OPR modes.
@@ -262,9 +317,6 @@ if probe.shape[0] > n_opr_modes:
 elif probe.shape[0] < n_opr_modes:
     probe = add_additional_opr_probe_modes_to_probe(probe, n_opr_modes - probe.shape[0])
 
-probe = torch.as_tensor(rescale_probe(probe, patterns), dtype=get_default_complex_dtype())
-opr_weights = generate_initial_opr_mode_weights(len(positions_px), probe.shape[0], probe=probe)
-print(f"probe: {tuple(probe.shape)} (n_opr, n_modes, h, w)")
 
 fig, axes = plt.subplots(1, probe.shape[1], figsize=(3 * probe.shape[1], 3))
 for i, ax in enumerate(np.atleast_1d(axes)):
@@ -273,11 +325,70 @@ for i, ax in enumerate(np.atleast_1d(axes)):
     ax.set_xticks([]), ax.set_yticks([])
 plt.show()
 
+probe = torch.as_tensor(rescale_probe(probe, patterns), dtype=get_default_complex_dtype())
+opr_weights = generate_initial_opr_mode_weights(len(positions_px), probe.shape[0], probe=probe)
+print(f"probe: {tuple(probe.shape)} (n_opr, n_modes, h, w)")
 
 #%% ---------------------------------------------------------------- initial object
 
 object_shape = get_suggested_object_size(positions_px, probe.shape[-2:], extra=object_padding_px)
-obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
+# obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
+# obj = torch.full((1, *object_shape), 1j, dtype=get_default_complex_dtype())
+
+# Seed the object from the patterns instead of starting flat. The data give
+# |FFT(P.O)| but not its phase; under the weak-object approximation the exit wave's
+# far field is dominated by the probe's, so seed the missing phase with the probe's
+# own and invert:
+#
+#     psi_j = IFFT( sqrt(I_j) . exp(i . angle(FFT(P))) )
+#     O_j   = psi_j . conj(P) / (|P|^2 + eps)
+#
+# The divide has to be Wiener-regularised because P is zero over most of the array,
+# and the per-position patches are stitched with the same |P|^2 weight the
+# reconstructor uses as its preconditioner.
+#
+# The seed is only as good as the probe it is given. Scored against the converged
+# reference object it reaches corr 0.75 when fed that converged probe, but 0.02 when
+# fed the synthesized speckle probe, whose far-field phase is unrelated to the real
+# beam -- so this earns its keep when init_recon_file supplies a real probe, and
+# does nothing for a synthesized one. Uncomment a line above to go back to flat.
+def seed_object(patterns, probe_2d, positions_px, object_shape, valid_pixel_mask):
+    """Weak-object estimate of the object from the patterns and a known probe."""
+    P = np.asarray(probe_2d, dtype=np.complex64)
+    n = P.shape[-1]
+    p_hat = np.fft.fft2(P)
+    seed_phase = np.exp(1j * np.angle(p_hat))
+    # At dead detector pixels there is no measurement; the model's own amplitude is
+    # the best stand-in and keeps the module gaps out of the seeded object.
+    amp_model = np.abs(p_hat)
+    keep = np.fft.ifftshift(valid_pixel_mask)
+
+    p_conj = np.conj(P)
+    p_sq = np.abs(P) ** 2
+    eps = 1e-3 * p_sq.max()
+    cy, cx = object_shape[0] // 2, object_shape[1] // 2
+
+    num = np.zeros(object_shape, dtype=np.complex64)
+    den = np.zeros(object_shape, dtype=np.float32)
+    for (pos_y, pos_x), pattern in zip(positions_px, patterns):
+        amp = np.where(keep, np.sqrt(np.fft.ifftshift(pattern)), amp_model)
+        psi = np.fft.ifft2(amp * seed_phase)
+        r0 = int(round(cy + pos_y - n / 2))
+        c0 = int(round(cx + pos_x - n / 2))
+        num[r0 : r0 + n, c0 : c0 + n] += psi * p_conj
+        den[r0 : r0 + n, c0 : c0 + n] += p_sq
+
+    est = num / (den + eps)
+    lit = den > 0.01 * den.max()
+    est = est / np.median(np.abs(est[lit]))   # mean transmission ~ 1, as for ones
+    return np.where(lit, est, 1.0).astype(np.complex64)   # unlit buffer stays clear
+
+
+obj = torch.as_tensor(
+    seed_object(patterns, probe[0, 0].numpy(), positions_px, object_shape,
+                valid_pixel_mask)[None],
+    dtype=get_default_complex_dtype(),
+)  # (n_slices, h, w)
 
 print(f"object buffer: {tuple(obj.shape)}")
 
@@ -302,6 +413,9 @@ options.data_options.free_space_propagation_distance_m = np.inf if far_field els
 # shift after the FFT, so the data must be pre-shifted. Near-field involves no
 # Fraunhofer FFT, so it must not be shifted.
 options.data_options.fft_shift = far_field
+# Same detector layout as `patterns`; Pty-Chi fft-shifts the mask alongside the
+# data under the same fft_shift flag (io_handles.PtychographyDataset).
+options.data_options.valid_pixel_mask = valid_pixel_mask
 options.data_options.save_data_on_device = False   # True is faster if it fits in VRAM
 
 # --- reconstructor ---
@@ -344,20 +458,22 @@ options.probe_options.orthogonalize_opr_modes.enabled = n_opr_modes > 1
 options.probe_options.power_constraint.enabled = True      # fracPy probePowerCorrectionSwitch
 options.probe_options.center_constraint.enabled = True     # fracPy comStabilizationSwitch
 
-options.probe_options.support_constraint.enabled = True
+# probe constrain in the real space
+options.probe_options.support_constraint.enabled = False
 options.probe_options.support_constraint.fixed_probe_support = (api.ProbeSupportMethods.ELLIPSE)
-options.probe_options.support_constraint.threshold = 1e-10
+options.probe_options.support_constraint.threshold = 1e-3
 options.probe_options.support_constraint.fixed_probe_support_params = [
     n_dp / 2, n_dp / 2,       # center row, center column
     probe_diameter_m / pixel_size_m / 2,
     probe_diameter_m / pixel_size_m / 2,  # radius in pixels
 ]
 
+# probe constrain in the Fourier space
 options.probe_options.fourier_support_constraint.enabled = True
 options.probe_options.fourier_support_constraint.optimization_plan = (
-    OptimizationPlan(start=probe_start, stride=5)
+    OptimizationPlan(start=probe_start, stride=1)
 )
-options.probe_options.fourier_support_constraint.radius_px = 400
+options.probe_options.fourier_support_constraint.radius_px = 200
 
 # --- probe positions (fracPy pcPIE) ---
 if position_start is None:
