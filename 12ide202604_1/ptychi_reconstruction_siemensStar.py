@@ -12,12 +12,12 @@
 #   params.momentumAcceleration    -> reconstructor_options.momentum_acceleration_gain
 #   params.positionCorrectionSwitch-> probe_position_options.optimizable
 
-# from utils import use_inline_backend
-# use_inline_backend()             # Plot Viewer-compatible backend, in its own cell
+from utils import use_inline_backend
+use_inline_backend()             # Plot Viewer-compatible backend, in its own cell
 
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "8"  # This makes GPU N appear as GPU 0 to CuPy
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # This makes GPU N appear as GPU 0 to CuPy
 
 import logging
 from pathlib import Path
@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-# from utils import center_crop_or_pad,show_ptychogram,make_probe,hermite_secondary_modes
+from utils import center_crop_or_pad,show_ptychogram,make_probe,hermite_secondary_modes
 
 import ptychi.api as api
 from ptychi.api.options.base import OptimizationPlan
@@ -67,7 +67,7 @@ init_recon_file = (
 
 # out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
 out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_edgeK200_detMask_0mode_objinit"            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_edgeK200_objinit_objk100"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -447,6 +447,18 @@ options.object_options.determine_position_origin_coords_by = (
 # options.object_options.l2_norm_constraint.weight = 1e-3
 # options.object_options.smoothness_constraint.enabled = True
 # options.object_options.smoothness_constraint.alpha = 0.05
+
+# object constrain in the Fourier space
+options.object_options.fourier_support_constraint.enabled = True
+options.object_options.fourier_support_constraint.optimization_plan = (
+    OptimizationPlan(start=0, stride=1)
+)
+# Absolute cutoff in FFT bins of the object buffer. Takes priority over the ratio
+# below; set it to None to fall back to the ratio. Note the object buffer is sized
+# per scan, so a fixed bin radius drifts in physical frequency between scans.
+options.object_options.fourier_support_constraint.radius_px = 100
+# Used only when radius_px is None: ko / kp in cycles/m against the probe cutoff.
+options.object_options.fourier_support_constraint.radius_ratio_to_probe = 0.5
 
 # --- probe ---
 options.probe_options.optimizable = True
