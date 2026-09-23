@@ -1,20 +1,8 @@
 #%%
 # Pty-Chi (LSQML) reconstruction of the 12-ID-C Siemens star scan.
-#
-# fracPy -> Pty-Chi parameter map:
-#   exampleData.ptychogram         -> data_options.data                (n, N, N) intensities
-#   exampleData.encoder / dxo      -> probe_position_{y,x}_px
-#   exampleData.wavelength         -> data_options.wavelength_m
-#   exampleData.dxo / dxp          -> object_options.pixel_size_m
-#   propagatorType 'Fraunhofer'    -> free_space_propagation_distance_m = inf
-#   reconstruction.npsm            -> probe axis 1 (incoherent modes)
-#   params.orthogonalizationSwitch -> probe_options.orthogonalize_incoherent_modes
-#   params.momentumAcceleration    -> reconstructor_options.momentum_acceleration_gain
-#   params.positionCorrectionSwitch-> probe_position_options.optimizable
 
 from utils import use_inline_backend
 use_inline_backend()             # Plot Viewer-compatible backend, in its own cell
-
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # This makes GPU N appear as GPU 0 to CuPy
@@ -26,8 +14,9 @@ import h5py
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
 
-from utils import center_crop_or_pad,show_ptychogram,make_probe,hermite_secondary_modes
+from utils import center_crop_or_pad,show_ptychogram,make_randomized_zoneplate_probe,hermite_secondary_modes
 
 import ptychi.api as api
 from ptychi.api.options.base import OptimizationPlan
@@ -67,7 +56,7 @@ init_recon_file = (
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_goodinitProbe_esw"            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_initprobe_fromzpOSA_edgek200"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -92,29 +81,11 @@ pixel_size_m = wavelength_m * det_dist_m / (n_dp * det_pixel_m)
 
 n_probe_modes = 5                # fracPy reconstruction.npsm, mix-state modes
 n_opr_modes = 1                  # variable probe (OPR); 1 disables it
-probe_diameter_m = 3.95e-6       # only used when no probe comes from init_recon_file, works as entrance pupil
-probe_init_type = "disk"         # "disk" or "gaussian" (only used when no probe comes from init_recon_file)
-
-# Speckle in the synthesized initial probe, set to resemble the probe in the
-# init_recon_file recon above. Measured from probe[0, 0] of that file (OPR mode
-# 0 is the real one -- modes 1-3 have ~1e-4 weight against 0.995 for mode 0):
-#
-#   intensity contrast 0.990   fully developed speckle
-#   amplitude spread   0.520   Rayleigh, so the amplitude is speckled too,
-#                              not just the phase
-#   wrapped phase rms  1.81    = pi/sqrt(3), i.e. uniform
-#   field grain        82.5 nm autocorrelation FWHM
-#   beam size          3.95 um fitted soft disk
-#
-# probe_speckle_grain_m is the grain you actually see: the FWHM of the field
-# autocorrelation. Here the diffuser modulates amplitude and does not wrap, so
-# that is just the smoothing kernel's own correlation length -- unlike the
-# phase-only case, where 2*pi wrapping makes the wavefront far finer than the
-# screen behind it. make_probe solves for the kernel and prints both.
-probe_speckle = 1.0               # fully developed: Rayleigh amplitude, uniform phase
-probe_speckle_grain_m = 82.5e-9   # delivered grain (autocorrelation FWHM)
-probe_speckle_phase_only = False  # the reference speckles amplitude, not just phase
-probe_speckle_seed = 0            # change for a different realization
+probe_focal_spot_diameter_m = 3.5e-6   # desired illuminated footprint at the sample (2*Rmax)
+probe_diameter_m = probe_focal_spot_diameter_m  # feeds the real-space support constraint below
+probe_outer_zone_width_m = 50e-9       # finest zone of the (randomized) zone plate
+probe_zp_central_stop = 0.15           # fraction of the simulated zone plate's radius blocked
+probe_zp_seed = 0                      # change for a different speckle realization
 
 # Rotation of the incoherent-mode basis. The reference's modes 1 and 2 are
 # two-lobe modes split along the diagonals (dipole axes -55.7 and +38.1 deg) and
@@ -129,16 +100,16 @@ probe_mode_rotation_deg = 38.0
 
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
-num_epochs = 1000
+num_epochs = 1500
 save_freq_iterations = 500       # write a recon_Niter*.h5 snapshot every N epochs
-batch_size = 120                 # the number of scan positions
+batch_size = 100                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
 noise_model = api.NoiseModels.GAUSSIAN  # fracPy params.noiseModel
-momentum_gain = 0              # fracPy params.momentumAcceleration
+momentum_gain = 0.25              # fracPy params.momentumAcceleration
 
 probe_start = 10                  # epoch at which the probe starts updating
-opr_start = 10                   # None disables OPR weight optimization
-position_start = None              # None disables position correction (fracPy pcPIE)
+opr_start = None                   # None disables OPR weight optimization
+position_start = 10              # None disables position correction (fracPy pcPIE)
 orthogonalization_stride = 5     # fracPy params.orthogonalizationFrequency
 position_update_limit_px = 20.0
 optimize_intensity_variation = False   # per-position beam intensity ("ic")
@@ -205,7 +176,7 @@ if init_recon_file is not None:
     with h5py.File(init_recon_file, "r") as f:
         print(f"keys in {init_recon_file.name}: {list(f.keys())}")
         # prior["object"] = np.asarray(f["object"][()]).view(np.complex64)
-        prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
+        # prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
         prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
 
 if "positions_px" in prior:
@@ -254,32 +225,52 @@ if "probe" in prior:
     probe = torch.as_tensor(np.ascontiguousarray(probe), dtype=get_default_complex_dtype())
     print(f"probe from {init_recon_file.name}: {tuple(probe.shape)}")
 else:
-    probe_init = make_probe(
-        n_dp, probe_init_type, diameter=probe_diameter_m, pixel_size_m=pixel_size_m,
-        speckle=probe_speckle, speckle_grain_m=probe_speckle_grain_m,
-        speckle_phase_only=probe_speckle_phase_only, seed=probe_speckle_seed,
-        verbose=True,
+    probe_init = make_randomized_zoneplate_probe(
+        n_dp, pixel_size_m, wavelength_m,
+        probe_outer_zone_width_m, probe_focal_spot_diameter_m,
+        central_stop=probe_zp_central_stop, seed=probe_zp_seed,
     )
-
-    # make_probe builds a filled disc, so its far field is a filled blob peaking at
-    # r=12 with 10.3% of the power inside r<20. The real beam is a zone-plate annulus
-    # peaking at r=36 with 0.24% in the central stop's shadow -- 43x less. Left alone
-    # the reconstruction has to dig all that out of the stop region first.
+    # The physical simulation gets the probe's real-space footprint, grain, and
+    # confinement right, but it is still a random realization -- its far-field
+    # ENERGY DISTRIBUTION has no reason to match the real optic's. Measured:
+    # this simulated probe's far field peaks at DC, with 60% of its power
+    # inside detector radius 20 px, where the real beam (recon_Niter400.h5,
+    # same method) instead shows a clean annulus peaking at r~36 with ~0% near
+    # DC -- the hallmark of a real zone plate + central beamstop. Left alone,
+    # the reconstructor has no way to explain that mismatch except by
+    # corrupting the object before the probe is even allowed to update
+    # (probe_start=100) -- not a resolution problem, a "can't see the spokes
+    # at all" problem.
     #
-    # Fix it with Gerchberg-Saxton against the measured illumination: a low percentile
-    # across positions keeps what every frame has in common (the beam) and suppresses
-    # the position-dependent object scatter. Alternate imposing that amplitude in the
-    # far field with make_probe's own real-space envelope, so the probe stays the one
-    # you built -- only its far-field amplitude is corrected, from your own data.
-    # Measured result: peak radius 12 -> 36 and 0.1028 -> 0.0024 inside r<20, both
-    # matching the data exactly. Scale is irrelevant here, rescale_probe follows.
+    # Fix it with Gerchberg-Saxton against the measured illumination: a low
+    # percentile across positions keeps what every frame has in common (the
+    # beam) and suppresses the position-dependent object scatter. Alternate
+    # imposing that amplitude in the far field with the simulated probe's own
+    # real-space envelope, so the probe keeps the footprint/grain already
+    # validated -- only its far-field amplitude is corrected, from the data.
     #
     # Note this fixes the far-field AMPLITUDE only. The far-field PHASE stays
-    # arbitrary -- GS converges to some field consistent with both amplitudes, not to
-    # your beam's actual speckle phase, which only a reconstruction recovers.
+    # arbitrary -- GS converges to some field consistent with both amplitudes,
+    # not to the real beam's actual speckle phase, which only a reconstruction
+    # recovers.
+    #
+    # The target amplitude is gap-filled across dead/stuck detector pixels
+    # (module gaps) before use, instead of leaving those rows/columns
+    # unconstrained in every GS iteration. Leaving them free lets the
+    # iteration settle on an arbitrary value there each time that need not
+    # agree with its now tightly-constrained neighbors -- confirmed to
+    # produce grid-aligned streak artifacts in the far field, exactly at the
+    # detector's module-gap rows/columns, that the real probe does not have.
+    # Filling the gaps first (normalized convolution: blur data*mask and
+    # mask separately, divide) and imposing the result everywhere removes
+    # the streaks while keeping the same ring match.
     gs_iterations = 200
-    _ff_amp = np.sqrt(np.fft.ifftshift(np.percentile(patterns, 10, axis=0)))
-    _measured = np.fft.ifftshift(valid_pixel_mask)   # no measurement at dead pixels
+    _percentile_10 = np.percentile(patterns, 10, axis=0)
+    _mask = valid_pixel_mask.astype(np.float32)
+    _num = gaussian_filter(_percentile_10 * _mask, sigma=3.0)
+    _den = gaussian_filter(_mask, sigma=3.0)
+    _gap_filled = np.where(valid_pixel_mask, _percentile_10, _num / np.maximum(_den, 1e-6))
+    _ff_amp = np.sqrt(np.fft.ifftshift(_gap_filled))
     _p = np.asarray(probe_init, dtype=np.complex64)
     _flat = _p.reshape(-1, n_dp, n_dp)
     for _i in range(_flat.shape[0]):
@@ -287,13 +278,15 @@ else:
         _envelope = np.abs(_mode) > 0.01 * np.abs(_mode).max()
         for _ in range(gs_iterations):
             _far = np.fft.fft2(_mode)
-            _far = np.where(_measured, _ff_amp * np.exp(1j * np.angle(_far)), _far)
+            _far = _ff_amp * np.exp(1j * np.angle(_far))   # imposed everywhere, no free region
             _mode = np.fft.ifft2(_far) * _envelope
         _flat[_i] = _mode
     probe_init = _flat.reshape(_p.shape)
 
-    probe = torch.as_tensor(probe_init,dtype=get_default_complex_dtype(),)
-    print(f"synthesized {probe_init_type} probe, diameter {probe_diameter_m * 1e6:.2f} um, "
+    probe = torch.as_tensor(probe_init, dtype=get_default_complex_dtype())
+    print(f"synthesized randomized-zone-plate probe: focal spot "
+          f"{probe_focal_spot_diameter_m * 1e6:.2f} um, outer zone "
+          f"{probe_outer_zone_width_m * 1e9:.0f} nm, "
           f"far field matched to the data in {gs_iterations} GS iterations")
 
 # Incoherent modes: keep what we have, fill the rest with Hermite modes.
@@ -335,107 +328,11 @@ print(f"probe: {tuple(probe.shape)} (n_opr, n_modes, h, w)")
 
 #%% ---------------------------------------------------------------- initial object
 
-# PRL-style per-position ESW estimate: Williams et al., "Fresnel Coherent Diffractive
-# Imaging," Phys. Rev. Lett. 97, 025506 (2006), Eq. (3). At each position, iterate
-#
-#     rho_{k+1} = F^-1[ M( F[rho_k] + Psi_inc ) - Psi_inc ]
-#
-# where rho = T.psi_inc is the object-induced perturbation of the exit wave (rho_0 = 0,
-# i.e. "no object yet"), Psi_inc = F[psi_inc] is the known illumination's own far field
-# (precomputed once), and M enforces the measured modulus at valid detector pixels,
-# leaving the current estimate alone at dead/stuck pixels (same `valid_pixel_mask`
-# convention used for the probe's own GS fit above). Unlike a single Wiener division,
-# this iterates the actual modulus constraint against the measured data at every
-# position, so it isn't limited to a weak-object approximation.
-#
-# CAVEAT: this omits the paper's real-space support constraint (pi_s in their Eq. 1/3).
-# Their support -- the isolated gold sample surrounded by vacuum -- is what gave plain ER
-# its resistance to the twin image and its clean, ~30-iteration convergence. The Siemens
-# star fills the field of view with no equivalent vacuum region, so there's nothing
-# physically correct to threshold to zero, and this was deliberately run without one on
-# request. What's left is the known-illumination modulus trick alone -- still legitimate,
-# since the paper credits the curved/structured illumination itself (not the support)
-# with making the solution unique -- but expect noisier, slower, less certain convergence
-# per position than the paper reports, and no protection against stagnation or the twin
-# image.
-#
-# Positions are processed independently (no overlap redundancy shared during the ER
-# iterations themselves), then combined afterward with the same |P|^2-weighted stitch
-# `seed_object` used in the non-ESW script. Runs batched in Torch on GPU since
-# n_iterations x n_positions x 2 FFTs of size n_dp^2 is too slow as a per-position NumPy
-# loop.
-def esw_object_prl(
-    patterns, probe_2d, positions_px, object_shape, valid_pixel_mask,
-    n_iterations=500, batch_size=32, verbose=True,
-):
-    """Per-position ESW estimate via known-illumination ER (no support constraint)."""
-    torch_device = "cuda" if torch.cuda.is_available() else "cpu"
-    P = torch.as_tensor(np.asarray(probe_2d, dtype=np.complex64), device=torch_device)
-    n = P.shape[-1]
-    Psi_inc = torch.fft.fft2(P)  # illumination's own far field, precomputed once
-    keep = torch.as_tensor(np.fft.ifftshift(valid_pixel_mask), device=torch_device)
-
-    p_conj = torch.conj(P)
-    p_sq = P.abs() ** 2
-    eps = 1e-3 * p_sq.max()
-    cy, cx = object_shape[0] // 2, object_shape[1] // 2
-
-    num = torch.zeros(object_shape, dtype=torch.complex64, device=torch_device)
-    den = torch.zeros(object_shape, dtype=torch.float32, device=torch_device)
-
-    n_pos = len(positions_px)
-    err_num, err_den = 0.0, 0.0
-    for start in range(0, n_pos, batch_size):
-        sl = slice(start, start + batch_size)
-        batch_patterns = np.fft.ifftshift(patterns[sl], axes=(-2, -1)).astype(np.float32)
-        target_amp = torch.sqrt(
-            torch.clamp(torch.as_tensor(batch_patterns, device=torch_device), min=0)
-        )
-        b = target_amp.shape[0]
-        rho = torch.zeros((b, n, n), dtype=torch.complex64, device=torch_device)
-
-        for _ in range(n_iterations):
-            far = torch.fft.fft2(rho) + Psi_inc  # (i) propagate, (ii) add illumination
-            amp = far.abs()
-            corrected = torch.where(
-                amp > 1e-12, target_amp * far / amp, target_amp.to(far.dtype)
-            )
-            far = torch.where(keep, corrected, far)  # (iii) modulus at valid pixels only
-            rho = torch.fft.ifft2(far - Psi_inc)      # (iv) subtract illum., (v) backpropagate
-
-        # Track a chi^2-like relative modulus error (paper's Eq. 2) for convergence sanity.
-        far_final = (torch.fft.fft2(rho) + Psi_inc).abs()
-        err_num += (((far_final - target_amp) ** 2) * keep).sum().item()
-        err_den += ((target_amp ** 2) * keep).sum().item()
-
-        pos_batch = positions_px[sl]
-        for i in range(b):
-            pos_y, pos_x = pos_batch[i]
-            r0 = int(round(cy + pos_y - n / 2))
-            c0 = int(round(cx + pos_x - n / 2))
-            num[r0 : r0 + n, c0 : c0 + n] += rho[i] * p_conj
-            den[r0 : r0 + n, c0 : c0 + n] += p_sq
-
-    if verbose:
-        print(f"ESW/PRL seed: relative modulus chi^2 after {n_iterations} iters "
-              f"= {err_num / err_den:.4e}")
-
-    est = num / (den + eps)
-    lit = den > 0.01 * den.max()
-    est = est / torch.median(est[lit].abs())
-    est = torch.where(lit, est, torch.ones_like(est))
-    return est.cpu().numpy().astype(np.complex64)
-
-
 object_shape = get_suggested_object_size(positions_px, probe.shape[-2:], extra=object_padding_px)
-# obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
+obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
 # obj = torch.full((1, *object_shape), 1j, dtype=get_default_complex_dtype())
 
-obj = torch.as_tensor(
-    esw_object_prl(patterns, probe[0, 0].numpy(), positions_px, object_shape,
-                   valid_pixel_mask)[None],
-    dtype=get_default_complex_dtype(),
-)  # (n_slices, h, w)
+print(f"object buffer: {tuple(obj.shape)}")
 
 fig, axes = plt.subplots(1, 2, figsize=(8, 4))
 axes[0].imshow(np.abs(obj[0].numpy()), cmap="gray")
@@ -483,23 +380,28 @@ options.object_options.build_preconditioner_with_all_modes = True
 options.object_options.determine_position_origin_coords_by = (
     api.ObjectPosOriginCoordsMethods.SUPPORT
 )
+# fracPy object constraints (all off in the source script):
+# options.object_options.l2_norm_constraint.enabled = True
+# options.object_options.l2_norm_constraint.weight = 1e-3
+# options.object_options.smoothness_constraint.enabled = True
+# options.object_options.smoothness_constraint.alpha = 0.05
 
 # object constrain in the Fourier space
 options.object_options.fourier_support_constraint.enabled = False
 options.object_options.fourier_support_constraint.optimization_plan = (
-    OptimizationPlan(start=200, stride=1)
+    OptimizationPlan(start=0, stride=1)
 )
 # Absolute cutoff in FFT bins of the object buffer. Takes priority over the ratio
 # below; set it to None to fall back to the ratio. Note the object buffer is sized
 # per scan, so a fixed bin radius drifts in physical frequency between scans.
-options.object_options.fourier_support_constraint.radius_px = 50
+options.object_options.fourier_support_constraint.radius_px = 100
 # Used only when radius_px is None: ko / kp in cycles/m against the probe cutoff.
 options.object_options.fourier_support_constraint.radius_ratio_to_probe = 0.5
 
 # --- probe ---
 options.probe_options.optimizable = True
 options.probe_options.optimizer = api.Optimizers.SGD
-options.probe_options.step_size = 0.5
+options.probe_options.step_size = 0.4
 options.probe_options.optimization_plan = OptimizationPlan(start=probe_start)
 options.probe_options.orthogonalize_incoherent_modes.enabled = n_probe_modes > 1
 options.probe_options.orthogonalize_incoherent_modes.optimization_plan = OptimizationPlan(
@@ -510,15 +412,6 @@ options.probe_options.orthogonalize_opr_modes.enabled = n_opr_modes > 1
 options.probe_options.power_constraint.enabled = True      # fracPy probePowerCorrectionSwitch
 options.probe_options.center_constraint.enabled = True     # fracPy comStabilizationSwitch
 
-# probe constrain in the real space
-options.probe_options.support_constraint.enabled = False
-options.probe_options.support_constraint.fixed_probe_support = (api.ProbeSupportMethods.ELLIPSE)
-options.probe_options.support_constraint.threshold = 1e-3
-options.probe_options.support_constraint.fixed_probe_support_params = [
-    n_dp / 2, n_dp / 2,       # center row, center column
-    probe_diameter_m / pixel_size_m / 2,
-    probe_diameter_m / pixel_size_m / 2,  # radius in pixels
-]
 
 # probe constrain in the Fourier space
 options.probe_options.fourier_support_constraint.enabled = True
@@ -531,7 +424,7 @@ options.probe_options.fourier_support_constraint.radius_px = 200
 if position_start is None:
     options.probe_position_options.optimizable = False
 else:
-    options.probe_position_options.optimizable = True
+    options.probe_position_options.optimizable = False
     options.probe_position_options.optimizer = api.Optimizers.SGD
     options.probe_position_options.step_size = 0.3
     options.probe_position_options.optimization_plan = OptimizationPlan(start=position_start)

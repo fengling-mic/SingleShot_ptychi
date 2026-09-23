@@ -570,6 +570,266 @@ def make_disk_probe(size, diameter_px, **kwargs):
     return make_probe(size, kind="disk", diameter=diameter_px, **kwargs)
 
 
+def _fresnel_propagate(field_np, distance_m, dx_m, wavelength_m, device="cpu"):
+    """Single-FFT Fresnel transform of a 2D field (Pty-Chi's FresnelTransformPropagator).
+
+    Unlike angular-spectrum propagation, the destination plane comes back on a
+    DIFFERENT pixel pitch, `wavelength_m * |distance_m| / (n * dx_m)` -- exactly
+    the rescaling a zone plate's near field needs -- so this is used instead of
+    hand-rolling the FFT/scaling algebra. Returns (field_out, dx_out_m).
+    """
+    from ptychi.propagate import FresnelTransformPropagator, WavefieldPropagatorParameters
+
+    n = field_np.shape[-1]
+    params = WavefieldPropagatorParameters.create_simple(
+        wavelength_m=wavelength_m, width_px=n, height_px=n,
+        pixel_width_m=dx_m, pixel_height_m=dx_m,
+        propagation_distance_m=distance_m,
+    )
+    field = torch.as_tensor(np.ascontiguousarray(field_np), dtype=torch.complex64, device=device)
+    propagator = FresnelTransformPropagator(params).to(device)
+    out = propagator.propagate_forward(field)
+    dx_out_m = wavelength_m * abs(distance_m) / (n * dx_m)
+    return out.detach().cpu().numpy(), dx_out_m
+
+
+def make_randomized_zoneplate_probe(
+    size,
+    pixel_size_m,
+    wavelength_m,
+    outer_zone_width_m,
+    focal_spot_diameter_m,
+    zp_radius_m=None,
+    central_stop=0.15,
+    zp_transmission=-1.0 + 0j,
+    oversample=8,
+    osa_edge_softness=0.1,
+    seed=0,
+    power=1.0,
+    verbose=True,
+    device="cpu",
+    dtype=np.complex64,
+):
+    """Simulate the focal-spot probe of a randomized (speckle-coded) Fresnel zone plate.
+
+    A randomized zone plate jitters its zone boundaries by a random amount so
+    the focused beam is a broad, high-spatial-frequency speckle pattern rather
+    than a clean diffraction-limited spot -- the point being illumination
+    diversity for single-shot/few-frame ptychography, not a tight focus. This
+    builds that field from the optic's two physical specs directly, rather than
+    fitting speckle statistics borrowed from some other reconstruction's probe:
+
+        1. Random phase over a disk of radius Rmax = focal_spot_diameter_m / 2,
+           sampled at pixel_size_m -- the field as it should look once it
+           reaches the sample.
+        2. Back-propagate (Fresnel) by -foc to the zone-plate plane. foc solves
+           the zone-plate equation foc = 2 * zp_radius_m * outer_zone_width_m /
+           wavelength_m; the destination pixel pitch comes back rescaled from
+           `_fresnel_propagate`, not forced to match pixel_size_m.
+        3. Build the zone-plate transmission on THAT plane's own grid by
+           binarizing the SIGN of the backpropagated field's own phase --
+           `angle(field_zp) > 0` gets `zp_transmission`, the rest passes
+           untouched -- with no geometric zone-boundary formula involved.
+           `field_zp` is fully-developed speckle (a linear propagation of a
+           random-phase source), with grain size wavelength_m * foc /
+           (2 * Rmax) -- equal to outer_zone_width_m when zp_radius_m is left
+           at its default -- so thresholding its phase directly produces a
+           binary random mask at exactly that feature size; this IS the
+           "randomization". (An earlier version instead thresholded
+           floor((chirp + angle(field_zp)) / pi) against the deterministic
+           thin-lens chirp pi * R^2 / (wavelength_m * foc). Don't do that: since
+           `field_zp` is also the illumination here, the trig cross-term
+           between the two leaves a coherent, undegraded focusing wave riding
+           on top of the speckle -- an unphysical bright central spike,
+           confirmed by testing, that a real randomized zone plate does not
+           show.) A central stop (`central_stop` * zp_radius_m) and the outer
+           edge both get a soft tanh roll-off (`_soft_step`) rather than a
+           hard cutoff.
+        4. Forward-propagate by +foc back to the focus/object plane. Going out
+           and back by the same distance is self-inverse regardless of the
+           grid size used, so this plane's pixel pitch is exactly
+           `pixel_size_m` again -- no approximation needed to make that hold.
+        5. Order-sorting aperture: multiply by one more soft-edged circular
+           aperture of radius Rmax (`_soft_step`, edge width
+           `osa_edge_softness * Rmax`). A real (randomized or not) zone plate
+           always sends light into more than the one order that focuses, and
+           every real zone-plate microscope/ptychography setup blocks
+           everything else with a physical pinhole at the focus for exactly
+           this reason -- without it, step 4's output is a genuinely
+           unconfined diffraction pattern, most of its power scattered well
+           outside the intended footprint (confirmed by testing: only
+           50/70/90% of the power inside 3.05/4.31/6.73 um diameters at
+           osa_edge_softness=0 i.e. no OSA, against a 3.5 um target). At the
+           default 0.1 this confines 99.1% of the power inside
+           `focal_spot_diameter_m`.
+        6. Crop/pad to `size` (`center_crop_or_pad`), rescale total power.
+
+    Resolution depends only on `outer_zone_width_m`, not on `zp_radius_m`
+    (NA = wavelength_m / (2 * outer_zone_width_m) regardless of radius; the
+    radius only sets the self-consistent focal length above) -- so leaving
+    `zp_radius_m` at its default (`focal_spot_diameter_m / 2`, i.e. no larger
+    unlit zone-plate area beyond the illuminated footprint) does not cost any
+    resolution. Validated against on-site parameters (12-ID-C S0019, 8 keV,
+    8.8 nm sample-plane pixels): with the defaults here, a 50 nm outer zone
+    and a 3.5 um focal-spot spec deliver a probe with 99%+ of its power
+    inside that 3.5 um diameter and ~46-49 nm speckle grain -- both within a
+    few percent of the inputs, with no further tuning.
+
+    Parameters
+    ----------
+    size
+        Output array size (crop/pad target), e.g. the detector crop n_dp.
+    pixel_size_m, wavelength_m
+        Sample-plane pixel size and the illumination wavelength.
+    outer_zone_width_m
+        The zone plate's finest (outermost) zone width -- sets resolution and
+        speckle grain.
+    focal_spot_diameter_m
+        Desired illuminated footprint at the sample (2 * Rmax).
+    zp_radius_m
+        The simulated zone plate's own radius. None (default) sets it equal
+        to Rmax = focal_spot_diameter_m / 2 -- see the resolution note above
+        for why that loses nothing. Pass the real optic's clear-aperture
+        radius instead if it is known and much larger than Rmax; the
+        simulation grid (`oversample` px per outermost zone) scales with it.
+    central_stop
+        Fraction of zp_radius_m blocked by a central beam stop, 0 to disable.
+    zp_transmission
+        Complex transmission of an "odd" zone; default -1+0j is an idealized
+        lossless pi-phase zone plate. Override with the real optic's
+        delta/beta-derived transmission at its design energy for better
+        fidelity.
+    oversample
+        Minimum pixels per delivered speckle grain (== outer_zone_width_m at
+        the default zp_radius_m) at the zone-plate-plane grid; the grid size
+        is derived from this, not given directly.
+    osa_edge_softness
+        Edge width of the order-sorting aperture (step 5), as a fraction of
+        Rmax = focal_spot_diameter_m / 2; 0 disables it (not recommended --
+        see step 5). Matches the name and "fraction of aperture radius"
+        convention of `make_probe`'s own `edge_softness`.
+    seed
+        Realization of the random phase / zone jitter.
+    power
+        Total sum|psi|^2 of the returned probe; None leaves the raw scaling.
+    device
+        Where the two Fresnel transforms run ("cpu" by default -- the grid is
+        small enough that CPU is fast, and it avoids competing for GPU memory
+        with the reconstruction itself; pass "cuda" for a much larger
+        zp_radius_m).
+
+    Returns
+    -------
+    numpy.ndarray
+        Complex probe, shaped (1, 1, size, size) like `make_disk_probe`.
+    """
+    rng = np.random.default_rng(seed)
+    Rmax = focal_spot_diameter_m / 2.0
+    r_zp = Rmax if zp_radius_m is None else float(zp_radius_m)
+    bs_zp = central_stop * r_zp
+    foc = 2.0 * r_zp * outer_zone_width_m / wavelength_m
+
+    n_zp = int(np.ceil(2 * oversample * r_zp / pixel_size_m))
+    n_zp += n_zp % 2
+
+    # 1) random phase over a disk of radius Rmax, at the focus/object plane
+    Xf, Yf = _grid(n_zp, pixel_size_m)
+    support = np.hypot(Xf, Yf) <= Rmax
+    field = np.zeros((n_zp, n_zp), dtype=np.complex128)
+    field[support] = np.exp(2j * np.pi * rng.random(int(support.sum())))
+
+    # 2) back-propagate to the zone-plate plane
+    field_zp, res_zp = _fresnel_propagate(field, -foc, pixel_size_m, wavelength_m, device)
+
+    # 3) zone-plate transmission, on the zone-plate-plane's own grid: binarize
+    # the SIGN of the field's own phase -- no geometric zone-boundary formula.
+    # field_zp is fully-developed speckle already (a linear propagation of a
+    # random-phase source), with grain size wavelength_m * foc / (2 * Rmax)
+    # (== outer_zone_width_m at the default zp_radius_m), so this directly
+    # produces a binary random mask at that feature size.
+    #
+    # Do NOT thread the deterministic thin-lens chirp (pi * R^2 /
+    # (wavelength_m * foc)) into this threshold instead -- tried first, and
+    # since field_zp is also the illumination here, the trig cross-term
+    # between the fixed chirp and the field's own phase leaves a coherent,
+    # undegraded focusing wave riding on top of the speckle: an unphysical
+    # bright central spike, confirmed by testing, that a real randomized zone
+    # plate does not show.
+    Xz, Yz = _grid(n_zp, res_zp)
+    Rz = np.hypot(Xz, Yz)
+    transmission = np.where(np.angle(field_zp) > 0, zp_transmission, 1.0 + 0j)
+
+    edge = 4.0 * res_zp
+    envelope = _soft_step(Rz, r_zp, edge)
+    if central_stop > 0:
+        envelope = envelope * (1.0 - _soft_step(Rz, bs_zp, edge))
+    field_after_zp = field_zp * transmission * envelope
+
+    # 4) forward-propagate back to the focus/object plane
+    probe_full, res_out = _fresnel_propagate(field_after_zp, foc, res_zp, wavelength_m, device)
+
+    # 5) order-sorting aperture: a real zone plate always sends light into more
+    # than the one order that focuses, and every real ZP setup blocks the rest
+    # with a physical pinhole at the focus -- without this, the field above is
+    # a genuinely unconfined diffraction pattern, most of its power scattered
+    # well outside Rmax, not a focused beam. See the docstring for validated
+    # confinement numbers.
+    if osa_edge_softness > 0:
+        Xo, Yo = _grid(n_zp, res_out)
+        Ro = np.hypot(Xo, Yo)
+        probe_full = probe_full * _soft_step(Ro, Rmax, osa_edge_softness * Rmax)
+
+    # 6) crop/pad, rescale power
+    probe = center_crop_or_pad(probe_full, size)
+    if power is not None:
+        probe = probe * np.sqrt(power / max((np.abs(probe) ** 2).sum(), 1e-300))
+    probe = probe.astype(dtype)
+
+    if verbose:
+        # A speckled field is not a single smooth lobe, so `_fwhm` on a raw summed
+        # profile locks onto the width of whichever single bright grain lands
+        # nearest the peak (tens of nm) rather than the illuminated footprint --
+        # tried that first and it printed a wildly misleading "FWHM". The radius
+        # that contains a given fraction of the total power is the robust
+        # equivalent for this kind of pattern, so that is what is reported here.
+        inten = (np.abs(probe) ** 2).astype(np.float64)
+        yy, xx = np.mgrid[:size, :size] - size // 2
+        r_m = np.hypot(yy, xx) * pixel_size_m
+        order = np.argsort(r_m.ravel())
+        cum = np.cumsum(inten.ravel()[order])
+        cum /= max(cum[-1], 1e-300)
+        r_sorted = r_m.ravel()[order]
+        d50, d70 = (2 * r_sorted[np.searchsorted(cum, f)] for f in (0.5, 0.7))
+
+        # Measured from a small patch near the beam center, not the whole array:
+        # the OSA gives the field a real, well-defined amplitude taper over the
+        # full ~focal_spot_diameter_m disk, and that taper's own broad
+        # autocorrelation swamps _autocorr_fwhm_px's half-max crossing when run
+        # on the whole field (it reports the ENVELOPE size, off by >10x, not the
+        # fine speckle grain). A patch much smaller than the disk sees that taper
+        # as effectively flat, isolating the fine structure the same way a local
+        # crop would if measured off a real recorded probe image.
+        patch = int(np.clip(0.3 * focal_spot_diameter_m / pixel_size_m, 32, size))
+        c = size // 2
+        center_patch = probe[c - patch // 2 : c + patch // 2, c - patch // 2 : c + patch // 2]
+        grain_px = _autocorr_fwhm_px(np.real(center_patch))
+        grain_msg = (f"{grain_px * pixel_size_m * 1e9:.1f} nm"
+                     if np.isfinite(grain_px) and grain_px > 0 else "n/a")
+        print(
+            f"randomized zone plate: outer zone {outer_zone_width_m * 1e9:.1f} nm, "
+            f"zp radius {r_zp * 1e6:.3f} um, central stop {central_stop:.2f}, "
+            f"focal length {foc * 1e3:.3f} mm\n"
+            f"  zone-plate-plane grid {n_zp}x{n_zp} px at {res_zp * 1e9:.2f} nm/px "
+            f"(round-trip object-plane pixel {res_out * 1e9:.4f} nm vs input "
+            f"{pixel_size_m * 1e9:.4f} nm)\n"
+            f"  probe footprint (50%/70% power) ~ {d50 * 1e6:.2f}/{d70 * 1e6:.2f} um "
+            f"(target {focal_spot_diameter_m * 1e6:.2f} um), "
+            f"speckle grain ~ {grain_msg} (target {outer_zone_width_m * 1e9:.0f} nm)"
+        )
+
+    return probe[None, None]
+
+
 def _square_mode_orders(n_modes):
     """(a, b) exponent pairs in square order: (0,0), (1,0), (0,1), (1,1), ...
 
