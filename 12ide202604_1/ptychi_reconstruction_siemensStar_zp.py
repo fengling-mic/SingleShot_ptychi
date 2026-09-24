@@ -56,7 +56,7 @@ init_recon_file = (
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_initprobe_fromzpOSA_edgek200"            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_initprobe_fromzpOSA_GS"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -322,6 +322,7 @@ for i, ax in enumerate(np.atleast_1d(axes)):
     ax.set_xticks([]), ax.set_yticks([])
 plt.show()
 
+#%%
 probe = torch.as_tensor(rescale_probe(probe, patterns), dtype=get_default_complex_dtype())
 opr_weights = generate_initial_opr_mode_weights(len(positions_px), probe.shape[0], probe=probe)
 print(f"probe: {tuple(probe.shape)} (n_opr, n_modes, h, w)")
@@ -401,7 +402,7 @@ options.object_options.fourier_support_constraint.radius_ratio_to_probe = 0.5
 # --- probe ---
 options.probe_options.optimizable = True
 options.probe_options.optimizer = api.Optimizers.SGD
-options.probe_options.step_size = 0.4
+options.probe_options.step_size = 0.3
 options.probe_options.optimization_plan = OptimizationPlan(start=probe_start)
 options.probe_options.orthogonalize_incoherent_modes.enabled = n_probe_modes > 1
 options.probe_options.orthogonalize_incoherent_modes.optimization_plan = OptimizationPlan(
