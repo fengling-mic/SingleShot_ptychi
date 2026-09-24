@@ -56,7 +56,7 @@ init_recon_file = (
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_initprobe_fromzpOSA_GS"            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_initprobe_fromzpOSA_GS_eswonj_stepsize"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -100,7 +100,7 @@ probe_mode_rotation_deg = 38.0
 
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
-num_epochs = 1500
+num_epochs = 5500
 save_freq_iterations = 500       # write a recon_Niter*.h5 snapshot every N epochs
 batch_size = 100                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
@@ -264,7 +264,7 @@ else:
     # Filling the gaps first (normalized convolution: blur data*mask and
     # mask separately, divide) and imposing the result everywhere removes
     # the streaks while keeping the same ring match.
-    gs_iterations = 200
+    gs_iterations = 300
     _percentile_10 = np.percentile(patterns, 10, axis=0)
     _mask = valid_pixel_mask.astype(np.float32)
     _num = gaussian_filter(_percentile_10 * _mask, sigma=3.0)
@@ -329,11 +329,126 @@ print(f"probe: {tuple(probe.shape)} (n_opr, n_modes, h, w)")
 
 #%% ---------------------------------------------------------------- initial object
 
+# object_shape = get_suggested_object_size(positions_px, probe.shape[-2:], extra=object_padding_px)
+# obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
+# # obj = torch.full((1, *object_shape), 1j, dtype=get_default_complex_dtype())
+
+# print(f"object buffer: {tuple(obj.shape)}")
+
+# fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+# axes[0].imshow(np.abs(obj[0].numpy()), cmap="gray")
+# axes[0].set_title("initial object magnitude")
+# axes[1].imshow(np.angle(obj[0].numpy()), cmap="gray")
+# axes[1].set_title("initial object phase")
+# for ax in axes:
+#     ax.set_aspect("equal")
+# plt.tight_layout()
+# plt.show()
+
+#%%
+#%% ---------------------------------------------------------------- initial object
+
+# PRL-style per-position ESW estimate: Williams et al., "Fresnel Coherent Diffractive
+# Imaging," Phys. Rev. Lett. 97, 025506 (2006), Eq. (3). At each position, iterate
+#
+#     rho_{k+1} = F^-1[ M( F[rho_k] + Psi_inc ) - Psi_inc ]
+#
+# where rho = T.psi_inc is the object-induced perturbation of the exit wave (rho_0 = 0,
+# i.e. "no object yet"), Psi_inc = F[psi_inc] is the known illumination's own far field
+# (precomputed once), and M enforces the measured modulus at valid detector pixels,
+# leaving the current estimate alone at dead/stuck pixels (same `valid_pixel_mask`
+# convention used for the probe's own GS fit above). Unlike a single Wiener division,
+# this iterates the actual modulus constraint against the measured data at every
+# position, so it isn't limited to a weak-object approximation.
+#
+# CAVEAT: this omits the paper's real-space support constraint (pi_s in their Eq. 1/3).
+# Their support -- the isolated gold sample surrounded by vacuum -- is what gave plain ER
+# its resistance to the twin image and its clean, ~30-iteration convergence. The Siemens
+# star fills the field of view with no equivalent vacuum region, so there's nothing
+# physically correct to threshold to zero, and this was deliberately run without one on
+# request. What's left is the known-illumination modulus trick alone -- still legitimate,
+# since the paper credits the curved/structured illumination itself (not the support)
+# with making the solution unique -- but expect noisier, slower, less certain convergence
+# per position than the paper reports, and no protection against stagnation or the twin
+# image.
+#
+# Positions are processed independently (no overlap redundancy shared during the ER
+# iterations themselves), then combined afterward with the same |P|^2-weighted stitch
+# `seed_object` used in the non-ESW script. Runs batched in Torch on GPU since
+# n_iterations x n_positions x 2 FFTs of size n_dp^2 is too slow as a per-position NumPy
+# loop.
+def esw_object_prl(
+    patterns, probe_2d, positions_px, object_shape, valid_pixel_mask,
+    n_iterations=500, batch_size=50, verbose=True,
+):
+    """Per-position ESW estimate via known-illumination ER (no support constraint)."""
+    torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+    P = torch.as_tensor(np.asarray(probe_2d, dtype=np.complex64), device=torch_device)
+    n = P.shape[-1]
+    Psi_inc = torch.fft.fft2(P)  # illumination's own far field, precomputed once
+    keep = torch.as_tensor(np.fft.ifftshift(valid_pixel_mask), device=torch_device)
+
+    p_conj = torch.conj(P)
+    p_sq = P.abs() ** 2
+    eps = 1e-3 * p_sq.max()
+    cy, cx = object_shape[0] // 2, object_shape[1] // 2
+
+    num = torch.zeros(object_shape, dtype=torch.complex64, device=torch_device)
+    den = torch.zeros(object_shape, dtype=torch.float32, device=torch_device)
+
+    n_pos = len(positions_px)
+    err_num, err_den = 0.0, 0.0
+    for start in range(0, n_pos, batch_size):
+        sl = slice(start, start + batch_size)
+        batch_patterns = np.fft.ifftshift(patterns[sl], axes=(-2, -1)).astype(np.float32)
+        target_amp = torch.sqrt(
+            torch.clamp(torch.as_tensor(batch_patterns, device=torch_device), min=0)
+        )
+        b = target_amp.shape[0]
+        rho = torch.zeros((b, n, n), dtype=torch.complex64, device=torch_device)
+
+        for _ in range(n_iterations):
+            far = torch.fft.fft2(rho) + Psi_inc  # (i) propagate, (ii) add illumination
+            amp = far.abs()
+            corrected = torch.where(
+                amp > 1e-12, target_amp * far / amp, target_amp.to(far.dtype)
+            )
+            far = torch.where(keep, corrected, far)  # (iii) modulus at valid pixels only
+            rho = torch.fft.ifft2(far - Psi_inc)      # (iv) subtract illum., (v) backpropagate
+
+        # Track a chi^2-like relative modulus error (paper's Eq. 2) for convergence sanity.
+        far_final = (torch.fft.fft2(rho) + Psi_inc).abs()
+        err_num += (((far_final - target_amp) ** 2) * keep).sum().item()
+        err_den += ((target_amp ** 2) * keep).sum().item()
+
+        pos_batch = positions_px[sl]
+        for i in range(b):
+            pos_y, pos_x = pos_batch[i]
+            r0 = int(round(cy + pos_y - n / 2))
+            c0 = int(round(cx + pos_x - n / 2))
+            num[r0 : r0 + n, c0 : c0 + n] += rho[i] * p_conj
+            den[r0 : r0 + n, c0 : c0 + n] += p_sq
+
+    if verbose:
+        print(f"ESW/PRL seed: relative modulus chi^2 after {n_iterations} iters "
+              f"= {err_num / err_den:.4e}")
+
+    est = num / (den + eps)
+    lit = den > 0.01 * den.max()
+    est = est / torch.median(est[lit].abs())
+    est = torch.where(lit, est, torch.ones_like(est))
+    return est.cpu().numpy().astype(np.complex64)
+
+
 object_shape = get_suggested_object_size(positions_px, probe.shape[-2:], extra=object_padding_px)
-obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
+# obj = torch.ones((1, *object_shape), dtype=get_default_complex_dtype())  # (n_slices, h, w)
 # obj = torch.full((1, *object_shape), 1j, dtype=get_default_complex_dtype())
 
-print(f"object buffer: {tuple(obj.shape)}")
+obj = torch.as_tensor(
+    esw_object_prl(patterns, probe[0, 0].numpy(), positions_px, object_shape,
+                   valid_pixel_mask)[None],
+    dtype=get_default_complex_dtype(),
+)  # (n_slices, h, w)
 
 fig, axes = plt.subplots(1, 2, figsize=(8, 4))
 axes[0].imshow(np.abs(obj[0].numpy()), cmap="gray")
@@ -375,7 +490,7 @@ options.reconstructor_options.rescale_probe_intensity_in_first_epoch = True
 # --- object ---
 options.object_options.optimizable = True
 options.object_options.optimizer = api.Optimizers.SGD
-options.object_options.step_size = 1.0
+options.object_options.step_size = 0.2
 options.object_options.pixel_size_m = pixel_size_m
 options.object_options.build_preconditioner_with_all_modes = True
 options.object_options.determine_position_origin_coords_by = (
@@ -402,7 +517,7 @@ options.object_options.fourier_support_constraint.radius_ratio_to_probe = 0.5
 # --- probe ---
 options.probe_options.optimizable = True
 options.probe_options.optimizer = api.Optimizers.SGD
-options.probe_options.step_size = 0.3
+options.probe_options.step_size = 0.2
 options.probe_options.optimization_plan = OptimizationPlan(start=probe_start)
 options.probe_options.orthogonalize_incoherent_modes.enabled = n_probe_modes > 1
 options.probe_options.orthogonalize_incoherent_modes.optimization_plan = OptimizationPlan(
