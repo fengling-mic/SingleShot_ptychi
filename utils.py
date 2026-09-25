@@ -971,6 +971,101 @@ def siemens_star(shape, n_spokes=24):
     return ((1 - 0.15 * spokes) * np.exp(1j * 0.8 * spokes)).astype(np.complex64)
 
 
+# ---------------------------------------------------------------------------
+# RPI (Randomized Probe Imaging) forward model
+#
+# Levitan et al., "Single-frame far-field diffractive imaging with randomized
+# illumination," Opt. Express 28, 37103 (2020), Eq. 1:
+#     E~ = F{ P . F^-1{ pad(F{O'}) } }
+# The object O' lives on a grid COARSER than the probe/detector (band-limited)
+# and is upsampled to full resolution by zero-padding its own Fourier
+# transform (`fourier_upsample_object`). `probe_fourier_radius` sizes that
+# coarse grid against the probe's own numerical aperture, per the paper's
+# resolution ratio R = ko/kp -- not against the detector's Nyquist frequency.
+# ---------------------------------------------------------------------------
+
+
+def probe_fourier_radius(probe_modes, quantile=0.95):
+    """kp in detector pixels: the radius of the probe's own far-field containing
+    `quantile` of its power. RPI's resolution ratio R = ko/kp is defined against this,
+    not against the detector's Nyquist frequency (= n_dp / 2)."""
+    ff = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, -1))) ** 2)
+    ff = ff.sum(0).detach().cpu().numpy()
+    n = ff.shape[-1]
+    yy, xx = np.mgrid[:n, :n]
+    r = np.hypot(yy - n / 2, xx - n / 2).astype(int)
+    cum = np.cumsum(np.bincount(r.ravel(), ff.ravel()))
+    return int(np.searchsorted(cum, quantile * cum[-1]))
+
+
+def rescale_probe_to_counts(probe_modes, measured, mask):
+    """Scale the probe so its far-field power matches the measured counts over the VALID
+    detector pixels -- the same pixels the loss is computed on. (Pty-Chi's rescale_probe
+    ignores the mask, which biases the scale by the dead-pixel fraction.)"""
+    ff = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, -1))) ** 2).sum(0)
+    return probe_modes * torch.sqrt((measured * mask).sum() / (ff * mask).sum())
+
+
+def fourier_resample(arr, n_out):
+    """Resample the last two axes to (n_out, n_out) over the SAME field of view, by
+    cropping or zero-padding the centred spectrum.
+
+    This is the real-space counterpart of cropping the detector, and it is what a probe
+    stored on a different grid needs. The array's field of view is
+        n_dp * pixel_size_m = wavelength_m * det_dist_m / det_pixel_m
+    which does NOT depend on n_dp -- changing the detector crop changes the *sampling* of
+    a fixed FOV. Center-cropping the probe instead would shrink its FOV (e.g. 512 -> 256
+    would give a 4.5 um probe against a 9.01 um object) and silently break the geometry.
+    Cropping the spectrum is also exactly what cropping the detector does to the measured
+    field, so this keeps probe and patterns consistent."""
+    n_in = arr.shape[-1]
+    if n_in == n_out:
+        return arr
+    assert (n_in - n_out) % 2 == 0, (
+        f"|{n_in} - {n_out}| must be even to keep the spectrum centred"
+    )
+    axes = (-2, -1)
+    spec = np.fft.fftshift(np.fft.fft2(arr, norm="ortho", axes=axes), axes=axes)
+    if n_out < n_in:
+        lo = (n_in - n_out) // 2
+        spec = spec[..., lo : lo + n_out, lo : lo + n_out]
+    else:
+        lo = (n_out - n_in) // 2
+        pad = [(0, 0)] * arr.ndim
+        pad[-2] = pad[-1] = (lo, lo)
+        spec = np.pad(spec, pad)
+    out = np.fft.ifft2(np.fft.ifftshift(spec, axes=axes), norm="ortho", axes=axes)
+    return out * (n_out / n_in)
+
+
+def fourier_upsample_object(obj_lowres, n_full):
+    """Zero-pad the object's own FFT out to n_full x n_full (RPI Eq. 1's `pad(F{O'})`
+    step): band-limited upsampling that reproduces obj_lowres exactly at the
+    corresponding full-res grid points. n_full - obj_lowres.shape[-1] must be even.
+    (Torch/autograd twin of fourier_resample's padding branch, kept separate because it
+    runs in the optimization hot loop.)"""
+    n_low = obj_lowres.shape[-1]
+    spec = torch.fft.fftshift(torch.fft.fft2(obj_lowres, norm="ortho"))
+    padded = torch.zeros((n_full, n_full), dtype=spec.dtype, device=spec.device)
+    lo = (n_full - n_low) // 2
+    padded[lo : lo + n_low, lo : lo + n_low] = spec
+    return torch.fft.ifft2(torch.fft.ifftshift(padded), norm="ortho") * (n_full / n_low)
+
+
+def simulate_rpi_diffraction(obj_lowres, probe_modes, n_full, background):
+    """RPI forward model (Eq. 1): upsample -> multiply by probe -> propagate -> incoherent sum."""
+    exit_waves = fourier_upsample_object(obj_lowres, n_full) * probe_modes
+    # Unnormalized FFT, matching the convention the probe was rescaled against.
+    far_field = torch.fft.fftshift(torch.fft.fft2(exit_waves), dim=(-2, -1))
+    return (far_field.abs() ** 2).sum(0) + background
+
+
+def rpi_diffraction_loss(predicted_intensity, measured_intensity, mask):
+    """Normalized amplitude MSE (Eq. 2), over valid detector pixels only."""
+    resid = (predicted_intensity.sqrt() - measured_intensity.sqrt()) ** 2
+    return (resid * mask).sum() / (measured_intensity * mask).sum()
+
+
 def _dp_frame(patterns, i, log, transpose):
     frame = np.asarray(patterns[i], dtype=np.float32)
     if transpose:                       # fracPy swaps axes 1,2 before showing

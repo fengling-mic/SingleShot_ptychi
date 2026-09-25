@@ -1,4 +1,5 @@
 #%%
+#%%
 # RPI (Randomized Probe Imaging) single-shot reconstruction of one diffraction pattern
 # from the 12-ID-C Siemens star scan, following Levitan et al., "Single-frame far-field
 # diffractive imaging with randomized illumination," Opt. Express 28, 37103 (2020).
@@ -14,12 +15,12 @@
 #
 # The size of the low-res object is set by the PROBE's numerical aperture, not by the
 # detector: the paper's resolution ratio is R = ko/kp where kp is the probe's maximum
-# spatial frequency (probe_fourier_radius below). Sizing it against the detector's
+# spatial frequency (utils.probe_fourier_radius). Sizing it against the detector's
 # Nyquist frequency instead silently runs at R ~ 1.5 here, far past the paper's
 # reliability limit of ~0.6, and the reconstruction then just fits shot noise.
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # This makes GPU N appear as GPU 0 to CuPy
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # This makes GPU N appear as GPU 0 to CuPy
 
 import logging
 from pathlib import Path
@@ -37,14 +38,26 @@ from ptychi.utils import (
     orthogonalize_initial_probe,
 )
 
+from utils import (
+    center_crop_or_pad,
+    fourier_resample,
+    fourier_upsample_object,
+    make_disk_probe,
+    probe_fourier_radius,
+    rescale_probe_to_counts,
+    rpi_diffraction_loss,
+    siemens_star,
+    simulate_rpi_diffraction,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 #%% ---------------------------------------------------------------- paths
 
-scan = "S1567"
-scan_initialGuess = "S1567"  # scan used to generate the initial guess (positions + probe)
-data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_2/02_levitan")
+scan = "S0019"
+scan_initialGuess = "S0019"  # scan used to generate the initial guess (positions + probe)
+data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test")
 
 dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.hdf5"
 para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
@@ -54,30 +67,38 @@ para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
 # synthesized probe instead.
 init_recon_file = (
     data_root / "ptychi_recons" / scan_initialGuess
-        / "Ndp600_LSQML_c30_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter1000.h5"
+    / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
 )
 
-out_dir = Path(__file__).parent / "recon_out" / scan
-
-# Set True to skip the beamline files and run the whole pipeline on a small
-# synthetic multi-position dataset (useful to debug the structure without the data share).
-use_simulated_data = False
+out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons"
+# out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
+recon_dir_suffix = ""            # appended to the folder name, e.g. "_v2" or "_pos"
 
 frame_index = 62   # index into the loaded scan's patterns/positions to reconstruct
+
+#%% ---------------------------------------------------------------- read the parameters from the file
+with h5py.File(para_file, "r") as f:
+    print(f"keys in {para_file.name}: {list(f.keys())}")
+    ppx = np.asarray(f["ppX"][()], dtype=np.float64).squeeze()
+    ppy = np.asarray(f["ppY"][()], dtype=np.float64).squeeze()
+    energy_kev = np.asarray(f["energy"][()], dtype=np.float32).squeeze()
+    detector_distance_m = np.asarray(f["detector_distance"][()], dtype=np.float32).squeeze()
+    exposure_time_ms = np.asarray(f["exposure_time_s"][()], dtype=np.float32).squeeze()
 
 
 #%% ---------------------------------------------------------------- geometry & knobs
 
-n_dp = 512                       # detector crop
-wavelength_m = 0.155e-9
-det_pixel_m = 172e-6             # detector pixel size
-det_dist_m = 10.0                # sample-detector distance
+n_dp = 1024                          # detector crop
+wavelength_m = 1.24e-9 / energy_kev # trasfer from keV to meters         
+det_pixel_m = 172e-6                # fracPy exampleData.dxd
+det_dist_m = detector_distance_m    # fracPy exampleData.zo
+far_field = True                    # fracPy propagatorType 'Fraunhofer'
 
 pixel_size_m = wavelength_m * det_dist_m / (n_dp * det_pixel_m)
 
-n_probe_modes = None             # None = keep every incoherent mode in the prior probe
+n_probe_modes = 5             # None = keep every incoherent mode in the prior probe
 n_opr_modes = 1                  # a single frame carries no probe-variation information
-probe_diameter_m = 1.0e-6        # only used when no probe comes from init_recon_file
+probe_diameter_m = 3.5e-6        # only used when no probe comes from init_recon_file
 
 # --- band limit -------------------------------------------------------------
 # R = ko/kp, measured against the probe's own Fourier support (NOT the detector).
@@ -126,172 +147,25 @@ random_seed = 123
 
 print(f"pixel size = {pixel_size_m * 1e9:.3f} nm, FOV = {n_dp * pixel_size_m * 1e6:.2f} um")
 
-
-#%% ---------------------------------------------------------------- helpers
-
-
-def center_crop_or_pad(arr, size):
-    """Center-crop (or zero-pad) the last two axes of `arr` to (size, size)."""
-    out = arr
-    for axis in (-2, -1):
-        n = out.shape[axis]
-        if n > size:
-            start = (n - size) // 2
-            out = np.take(out, np.arange(start, start + size), axis=axis)
-        elif n < size:
-            pad = [(0, 0)] * out.ndim
-            before = (size - n) // 2
-            pad[axis] = (before, size - n - before)
-            out = np.pad(out, pad)
-    return out
-
-
-def make_disk_probe(size, diameter_px):
-    """Soft-edged disk, used when there is no probe to inherit."""
-    yy, xx = np.mgrid[:size, :size] - (size - 1) / 2
-    r = np.hypot(yy, xx)
-    edge = max(0.1 * diameter_px / 2, 1.0)
-    disk = 0.5 * (1 - np.tanh((r - diameter_px / 2) / edge))
-    return disk.astype(np.complex64)[None, None]  # (n_opr, n_modes, h, w)
-
-
-def siemens_star(shape, n_spokes=24):
-    yy, xx = np.mgrid[: shape[0], : shape[1]]
-    theta = np.arctan2(yy - shape[0] / 2, xx - shape[1] / 2)
-    r = np.hypot(yy - shape[0] / 2, xx - shape[1] / 2)
-    spokes = (np.cos(n_spokes * theta) > 0) & (r < 0.45 * min(shape))
-    return ((1 - 0.15 * spokes) * np.exp(1j * 0.8 * spokes)).astype(np.complex64)
-
-
-def probe_fourier_radius(probe_modes, quantile=0.95):
-    """kp in detector pixels: the radius of the probe's own far-field containing
-    `quantile` of its power. RPI's resolution ratio R = ko/kp is defined against this,
-    not against the detector's Nyquist frequency (= n_dp / 2)."""
-    ff = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, -1))) ** 2)
-    ff = ff.sum(0).detach().cpu().numpy()
-    n = ff.shape[-1]
-    yy, xx = np.mgrid[:n, :n]
-    r = np.hypot(yy - n / 2, xx - n / 2).astype(int)
-    cum = np.cumsum(np.bincount(r.ravel(), ff.ravel()))
-    return int(np.searchsorted(cum, quantile * cum[-1]))
-
-
-def rescale_probe_to_counts(probe_modes, measured, mask):
-    """Scale the probe so its far-field power matches the measured counts over the VALID
-    detector pixels -- the same pixels the loss is computed on. (Pty-Chi's rescale_probe
-    ignores the mask, which biases the scale by the dead-pixel fraction.)"""
-    ff = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, -1))) ** 2).sum(0)
-    return probe_modes * torch.sqrt((measured * mask).sum() / (ff * mask).sum())
-
-
-def fourier_resample(arr, n_out):
-    """Resample the last two axes to (n_out, n_out) over the SAME field of view, by
-    cropping or zero-padding the centred spectrum.
-
-    This is the real-space counterpart of cropping the detector, and it is what a probe
-    stored on a different grid needs. The array's field of view is
-        n_dp * pixel_size_m = wavelength_m * det_dist_m / det_pixel_m
-    which does NOT depend on n_dp -- changing the detector crop changes the *sampling* of
-    a fixed FOV. Center-cropping the probe instead would shrink its FOV (e.g. 512 -> 256
-    would give a 4.5 um probe against a 9.01 um object) and silently break the geometry.
-    Cropping the spectrum is also exactly what cropping the detector does to the measured
-    field, so this keeps probe and patterns consistent."""
-    n_in = arr.shape[-1]
-    if n_in == n_out:
-        return arr
-    assert (n_in - n_out) % 2 == 0, (
-        f"|{n_in} - {n_out}| must be even to keep the spectrum centred"
-    )
-    axes = (-2, -1)
-    spec = np.fft.fftshift(np.fft.fft2(arr, norm="ortho", axes=axes), axes=axes)
-    if n_out < n_in:
-        lo = (n_in - n_out) // 2
-        spec = spec[..., lo : lo + n_out, lo : lo + n_out]
-    else:
-        lo = (n_out - n_in) // 2
-        pad = [(0, 0)] * arr.ndim
-        pad[-2] = pad[-1] = (lo, lo)
-        spec = np.pad(spec, pad)
-    out = np.fft.ifft2(np.fft.ifftshift(spec, axes=axes), norm="ortho", axes=axes)
-    return out * (n_out / n_in)
-
-
-def fourier_upsample_object(obj_lowres, n_full):
-    """Zero-pad the object's own FFT out to n_full x n_full (RPI Eq. 1's `pad(F{O'})`
-    step): band-limited upsampling that reproduces obj_lowres exactly at the
-    corresponding full-res grid points. n_full - obj_lowres.shape[-1] must be even.
-    (Torch/autograd twin of fourier_resample's padding branch, kept separate because it
-    runs in the optimization hot loop.)"""
-    n_low = obj_lowres.shape[-1]
-    spec = torch.fft.fftshift(torch.fft.fft2(obj_lowres, norm="ortho"))
-    padded = torch.zeros((n_full, n_full), dtype=spec.dtype, device=spec.device)
-    lo = (n_full - n_low) // 2
-    padded[lo : lo + n_low, lo : lo + n_low] = spec
-    return torch.fft.ifft2(torch.fft.ifftshift(padded), norm="ortho") * (n_full / n_low)
-
-
-def simulate_rpi_diffraction(obj_lowres, probe_modes, n_full, background):
-    """RPI forward model (Eq. 1): upsample -> multiply by probe -> propagate -> incoherent sum."""
-    exit_waves = fourier_upsample_object(obj_lowres, n_full) * probe_modes
-    # Unnormalized FFT, matching the convention the probe was rescaled against.
-    far_field = torch.fft.fftshift(torch.fft.fft2(exit_waves), dim=(-2, -1))
-    return (far_field.abs() ** 2).sum(0) + background
-
-
-def rpi_diffraction_loss(predicted_intensity, measured_intensity, mask):
-    """Normalized amplitude MSE (Eq. 2), over valid detector pixels only."""
-    resid = (predicted_intensity.sqrt() - measured_intensity.sqrt()) ** 2
-    return (resid * mask).sum() / (measured_intensity * mask).sum()
-
-
 #%% ---------------------------------------------------------------- load diffraction patterns
 
-if use_simulated_data:
-    # Small synthetic far-field dataset: 8x8 jittered grid over a Siemens star.
-    n_dp = 64
-    pixel_size_m = wavelength_m * det_dist_m / (n_dp * det_pixel_m)
-    n_probe_modes, n_opr_modes = 2, 2
-    sim_object_padding_px = 8
+with h5py.File(dp_file, "r") as f:
+    print(f"keys in {dp_file.name}: {list(f.keys())}")
+    patterns = f["dp"][()]
+    # Dead/hot detector pixels. Fitting them as if they were real counts biases the
+    # solution badly (ground-truth loss 0.036 -> 0.020 once masked).
+    det_mask = np.asarray(f["det_pixel_mask"][()], dtype=bool)
+print(f"raw ptychogram: {patterns.shape}")
 
-    rng = np.random.default_rng(0)
-    grid = (np.arange(8) - 3.5) * 12.0
-    gy, gx = np.meshgrid(grid, grid, indexing="ij")
-    positions_px_all = np.stack([gy.ravel(), gx.ravel()], -1) + rng.normal(0, 0.5, (64, 2))
+patterns = center_crop_or_pad(patterns, n_dp)
+if flip_dp_x:
+    patterns = patterns[..., :, ::-1]
+if flip_dp_y:
+    patterns = patterns[..., ::-1, :]
+patterns = np.ascontiguousarray(patterns, dtype=np.float32)
+np.clip(patterns, 0, None, out=patterns)
 
-    sim_shape = get_suggested_object_size(positions_px_all, (n_dp, n_dp), extra=sim_object_padding_px)
-    sim_obj = siemens_star(sim_shape)
-    sim_probe = make_disk_probe(n_dp, 40)[0, 0]
-
-    patterns = np.empty((len(positions_px_all), n_dp, n_dp), dtype=np.float32)
-    for i, (py, px) in enumerate(positions_px_all):
-        y0 = int(round(sim_shape[0] / 2 + py - n_dp / 2))
-        x0 = int(round(sim_shape[1] / 2 + px - n_dp / 2))
-        psi = sim_obj[y0 : y0 + n_dp, x0 : x0 + n_dp] * sim_probe
-        patterns[i] = np.abs(np.fft.fftshift(np.fft.fft2(psi, norm="ortho"))) ** 2
-    patterns = rng.poisson(patterns / patterns.max() * 1e4).astype(np.float32)
-    det_mask = np.ones((n_dp, n_dp), dtype=bool)
-    prior = {}
-else:
-    with h5py.File(dp_file, "r") as f:
-        print(f"keys in {dp_file.name}: {list(f.keys())}")
-        patterns = f["dp"][()]
-        # Dead/hot detector pixels. Fitting them as if they were real counts biases the
-        # solution badly (ground-truth loss 0.036 -> 0.020 once masked).
-        det_mask = np.asarray(f["det_pixel_mask"][()], dtype=bool)
-    print(f"raw ptychogram: {patterns.shape}")
-
-    patterns = center_crop_or_pad(patterns, n_dp)
-    det_mask = center_crop_or_pad(det_mask[None], n_dp)[0]
-    if flip_dp_x:
-        patterns = patterns[..., :, ::-1]
-        det_mask = det_mask[:, ::-1]
-    if flip_dp_y:
-        patterns = patterns[..., ::-1, :]
-        det_mask = det_mask[::-1, :]
-    patterns = np.ascontiguousarray(patterns, dtype=np.float32)
-    det_mask = np.ascontiguousarray(det_mask)
-    np.clip(patterns, 0, None, out=patterns)
-    print(f"detector mask: {det_mask.mean() * 100:.1f}% of pixels valid")
+print(f"ptychogram: {patterns.shape}, total counts {patterns.sum():.3e}")
 
 assert 0 <= frame_index < len(patterns), (
     f"frame_index={frame_index} out of range for {len(patterns)} patterns"
@@ -302,30 +176,29 @@ print(f"reconstructing frame {frame_index}: pattern {patterns.shape}, total coun
 
 #%% ---------------------------------------------------------------- positions + prior probe
 
-if not use_simulated_data:
-    prior = {}
-    if init_recon_file is not None:
-        with h5py.File(init_recon_file, "r") as f:
-            print(f"keys in {init_recon_file.name}: {list(f.keys())}")
-            prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
-            prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
+prior = {}
+if init_recon_file is not None:
+    with h5py.File(init_recon_file, "r") as f:
+        print(f"keys in {init_recon_file.name}: {list(f.keys())}")
+        prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
+        prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
 
-    if "positions_px" in prior:
-        positions_px_all = prior["positions_px"].copy()
-    else:
-        # fracPy read ppX/ppY (meters) from the para file; we want pixels.
-        with h5py.File(para_file, "r") as f:
-            print(f"keys in {para_file.name}: {list(f.keys())}")
-            ppx = np.asarray(f["ppX"][()], dtype=np.float64).squeeze()
-            ppy = np.asarray(f["ppY"][()], dtype=np.float64).squeeze()
-        positions_px_all = np.stack((ppy, ppx), axis=-1) / pixel_size_m
+if "positions_px" in prior:
+    positions_px_all = prior["positions_px"].copy()
+else:
+    # fracPy read ppX/ppY (meters) from the para file; we want pixels.
+    with h5py.File(para_file, "r") as f:
+        print(f"keys in {para_file.name}: {list(f.keys())}")
+        ppx = np.asarray(f["ppX"][()], dtype=np.float64).squeeze()
+        ppy = np.asarray(f["ppY"][()], dtype=np.float64).squeeze()
+    positions_px_all = np.stack((ppy, ppx), axis=-1) / pixel_size_m
 
-    if swap_position_axes:
-        positions_px_all = positions_px_all[:, ::-1].copy()
-    if flip_positions_y:
-        positions_px_all[:, 0] = -positions_px_all[:, 0]
-    if flip_positions_x:
-        positions_px_all[:, 1] = -positions_px_all[:, 1]
+if swap_position_axes:
+    positions_px_all = positions_px_all[:, ::-1].copy()
+if flip_positions_y:
+    positions_px_all[:, 0] = -positions_px_all[:, 0]
+if flip_positions_x:
+    positions_px_all[:, 1] = -positions_px_all[:, 1]
 
 assert frame_index < len(positions_px_all), (
     f"frame_index={frame_index} out of range for {len(positions_px_all)} positions"
