@@ -1410,6 +1410,48 @@ def make_recon_dir_name(cfg=None, suffix="", **knobs):
     return "_".join(parts) + suffix
 
 
+def make_rpi_recon_dir_name(cfg=None, suffix="", **knobs):
+    """Folder name for a single-frame RPI reconstruction, e.g.
+
+        frame62_RPI_Adam_Nobj88_R0.5_p10_opr1_pf
+
+    frame<i>, algorithm tag "RPI", the optimizer class name, Nobj<n_obj_lowres>
+    (the band-limited object grid actually used), R<rpi_resolution_ratio> (the
+    configured target ratio), p<n_probe_modes>, opr<n_opr_modes>, and either
+    "pf" (probe held fixed throughout) or "prel<rpi_probe_start>" (released at
+    that epoch).
+
+    Same calling convention as `make_recon_dir_name`: knobs come from `cfg`,
+    which defaults to the caller's globals, unless given as keywords, and a
+    bare string first argument is taken as the suffix. `optimizer_name` has no
+    same-named script variable (it is derived from the optimizer class used),
+    so pass it explicitly, e.g.
+    `make_rpi_recon_dir_name(recon_dir_suffix, optimizer_name=rpi_optimizer_cls.__name__)`.
+    """
+    if isinstance(cfg, str):
+        if suffix:
+            raise TypeError("suffix given both positionally and as a keyword")
+        cfg, suffix = None, cfg
+    if cfg is None:
+        cfg = _caller_globals()
+
+    def k(name, default=_MISSING):
+        return knobs[name] if name in knobs else _lookup(cfg, name, default)
+
+    probe_start = k("rpi_probe_start", None)
+    parts = [
+        f"frame{k('frame_index')}",
+        "RPI",
+        k("optimizer_name"),
+        f"Nobj{k('n_obj_lowres')}",
+        f"R{k('rpi_resolution_ratio'):g}",
+        f"p{k('n_probe_modes')}",
+        f"opr{k('n_opr_modes', 1)}",
+    ]
+    parts.append("pf" if probe_start is None else f"prel{probe_start}")
+    return "_".join(parts) + suffix
+
+
 def collect_params(cfg=None, **overrides):
     """The knob dump written to pear_params.json, keyed like PEAR's params.
 
@@ -1471,8 +1513,60 @@ def collect_params(cfg=None, **overrides):
     return {key: _jsonable(value) for key, value in params.items()}
 
 
+def collect_rpi_params(cfg=None, **overrides):
+    """The knob dump for a single-frame RPI reconstruction, written as rpi_params.json.
+
+    Unlike `collect_params` (which remaps script variables to PEAR's own key
+    names, for a file PEAR's tooling reads back), there is no external
+    consumer for RPI's params, so this just dumps the script's own knob names
+    directly. `cfg` defaults to the caller's globals; `overrides` win over it.
+    """
+    if cfg is None:
+        cfg = _caller_globals()
+
+    def k(name, default=_MISSING):
+        return _lookup(cfg, name, default)
+
+    init_recon_file = k("init_recon_file", None)
+    params = {
+        "scan": k("scan", ""),
+        "frame_index": k("frame_index"),
+        "data_directory": str(k("data_root", "")),
+        "path_to_init_recon": str(init_recon_file) if init_recon_file else "",
+        "n_dp": k("n_dp"),
+        "wavelength_m": k("wavelength_m"),
+        "det_pixel_m": k("det_pixel_m"),
+        "det_dist_m": k("det_dist_m"),
+        "pixel_size_m": k("pixel_size_m"),
+        "n_probe_modes": k("n_probe_modes"),
+        "n_opr_modes": k("n_opr_modes", 1),
+        "rpi_resolution_ratio": k("rpi_resolution_ratio"),
+        "rpi_kp_quantile": k("rpi_kp_quantile"),
+        "num_epochs": k("num_epochs"),
+        "optimizer": k("rpi_optimizer_cls").__name__,
+        "rpi_lr": k("rpi_lr"),
+        "rpi_lr_decay_factor": k("rpi_lr_decay_factor"),
+        "rpi_lr_decay_patience": k("rpi_lr_decay_patience"),
+        "rpi_min_lr": k("rpi_min_lr"),
+        "rpi_loss_floor": k("rpi_loss_floor"),
+        "rpi_object_init": k("rpi_object_init"),
+        "rpi_init_sigma": k("rpi_init_sigma"),
+        "rpi_background_counts": k("rpi_background_counts"),
+        "rpi_probe_start": k("rpi_probe_start", None),
+        "rpi_probe_lr_rel": k("rpi_probe_lr_rel", None),
+        "rpi_probe_anchor": k("rpi_probe_anchor", None),
+        "save_freq_iterations": k("save_freq_iterations", None),
+        "random_seed": k("random_seed"),
+    }
+    unknown = set(overrides) - set(params)
+    if unknown:
+        raise KeyError(f"unknown rpi_params key(s): {sorted(unknown)}")
+    params.update(overrides)
+    return {key: _jsonable(value) for key, value in params.items()}
+
+
 def save_initial_conditions(recon_dir, params=None, patterns=None, probe=None,
-                            positions_px=None, cfg=None):
+                            positions_px=None, cfg=None, params_filename="pear_params.json"):
     """Write pear_params.json and the dp_sum / init_probe / init_positions previews.
 
     `probe` is the initial guess in any of the shapes the scripts hold it in --
@@ -1481,7 +1575,9 @@ def save_initial_conditions(recon_dir, params=None, patterns=None, probe=None,
     Everything but `recon_dir` defaults to the same-named variable in `cfg`,
     which itself defaults to the caller's globals, so from a reconstruction
     script this is just `save_initial_conditions(recon_dir)`. `params` defaults
-    to `collect_params()` over that same namespace.
+    to `collect_params()` over that same namespace. `params_filename` lets a
+    caller whose `params` are not PEAR's own schema (e.g. RPI's
+    `collect_rpi_params`) avoid writing them under PEAR's own file name.
     """
     if tifffile is None:
         raise ImportError("tifffile is needed for the *.tiff previews")
@@ -1498,7 +1594,7 @@ def save_initial_conditions(recon_dir, params=None, patterns=None, probe=None,
     recon_dir = Path(recon_dir)
     recon_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(recon_dir / "pear_params.json", "w") as f:
+    with open(recon_dir / params_filename, "w") as f:
         json.dump(params, f, indent=4, default=_jsonable)
 
     tifffile.imwrite(recon_dir / "dp_sum.tiff", rgb_uint8(np.asarray(patterns).sum(0), log=True))
@@ -1623,6 +1719,93 @@ def save_reconstruction(task, recon_dir, n_iter=None, *, pixel_size_m=None,
     ax.set_aspect("equal"), ax.legend()
     fig.savefig(recon_dir / "positions" / f"positions_Niter{n_iter}.png", dpi=120,
                 bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"saved {recon_dir / f'recon_Niter{n_iter}.h5'}")
+
+
+def save_rpi_reconstruction(obj_lowres, obj_fullres, probe, losses, recon_dir, n_iter=None, *,
+                            pixel_size_m=None, object_pixel_size_m=None, position_px=None,
+                            illumination=None, extra_attrs=None, cfg=None):
+    """RPI's analogue of `save_reconstruction`: writes recon_Niter{n}.h5 plus previews for a
+    single-frame RPI reconstruction, matching its naming/layout as closely as the algorithm
+    allows.
+
+    There is no Pty-Chi `Task` here -- `save_reconstruction` reads positions, OPR weights
+    and position-correction history straight off one, none of which RPI has -- so this
+    takes the raw optimization state directly: `obj_lowres` (the band-limited variable
+    actually optimized), `obj_fullres` (its Fourier upsampling, `fourier_upsample_object`),
+    `probe` and the plain Python `losses` list the run loop appends to.
+
+    `n_iter` defaults to `len(losses)`, like `save_reconstruction`. `pixel_size_m` and
+    `object_pixel_size_m` are keyword-only and default to the same-named variables in `cfg`
+    (itself defaulting to the caller's globals). `position_px`, `illumination` and
+    `extra_attrs` (a flat dict of extra HDF5 attrs) are optional -- pass them on the final
+    save only; a mid-run checkpoint has no use for them.
+
+    Datasets:
+        object_lowres        (h_lo, w_lo)  complex64  the band-limited optimization variable
+        object                (h, w)       complex64  Fourier-upsampled to the full detector grid
+        probe                 (n_opr, n_modes, h, w) complex64
+        loss                  (n_epochs,)  float64
+        obj_pixel_size_m      scalar       float64
+        object_pixel_size_m   scalar       float64    pixel size of `object_lowres`
+        positions_px          (1, 2)       float32    only if `position_px` is given
+        illumination          (h, w)       float32    only if `illumination` is given
+    """
+    if tifffile is None:
+        raise ImportError("tifffile is needed for the *.tiff previews")
+    if cfg is None:
+        cfg = _caller_globals()
+    if pixel_size_m is None:
+        pixel_size_m = _lookup(cfg, "pixel_size_m")
+    if object_pixel_size_m is None:
+        object_pixel_size_m = _lookup(cfg, "object_pixel_size_m")
+    recon_dir = Path(recon_dir)
+    recon_dir.mkdir(parents=True, exist_ok=True)
+
+    def to_np(x):
+        return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
+    obj_lowres_np = to_np(obj_lowres)
+    obj_fullres_np = to_np(obj_fullres)
+    probe_np = to_np(probe)
+    loss = np.asarray(losses, dtype=np.float64)
+    if n_iter is None:
+        n_iter = len(loss)
+
+    with h5py.File(recon_dir / f"recon_Niter{n_iter}.h5", "w") as f:
+        f.create_dataset("object_lowres", data=obj_lowres_np.astype(np.complex64))
+        f.create_dataset("object", data=obj_fullres_np.astype(np.complex64))
+        f.create_dataset("probe", data=probe_np.astype(np.complex64))
+        f.create_dataset("loss", data=loss)
+        f.create_dataset("obj_pixel_size_m", data=np.float64(pixel_size_m))
+        f.create_dataset("object_pixel_size_m", data=np.float64(object_pixel_size_m))
+        if position_px is not None:
+            f.create_dataset("positions_px", data=np.asarray(position_px, dtype=np.float32))
+        if illumination is not None:
+            f.create_dataset("illumination", data=np.asarray(illumination, dtype=np.float32))
+        for key, value in (extra_attrs or {}).items():
+            f.attrs[key] = value
+
+    p = probe_np
+    while p.ndim > 3:                                   # (n_opr, n_modes, h, w) -> modes
+        p = p[0]
+    if p.ndim == 2:
+        p = p[None]
+    for sub, img in (
+        ("object_mag", gray_uint16(np.abs(obj_fullres_np))),
+        ("object_ph", gray_uint16(np.angle(obj_fullres_np))),
+        ("probe_mag", rgb_uint8(np.concatenate([np.abs(p[i]) for i in range(p.shape[0])], axis=1))),
+    ):
+        (recon_dir / sub).mkdir(exist_ok=True)
+        tifffile.imwrite(recon_dir / sub / f"{sub}_Niter{n_iter}.tiff", img)
+
+    (recon_dir / "loss").mkdir(exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5, 3))
+    ax.semilogy(np.arange(1, len(loss) + 1), loss)
+    ax.set_xlabel("epoch"), ax.set_ylabel("loss")
+    fig.savefig(recon_dir / "loss" / f"loss_Niter{n_iter}.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
 
     print(f"saved {recon_dir / f'recon_Niter{n_iter}.h5'}")

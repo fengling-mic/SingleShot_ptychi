@@ -40,12 +40,16 @@ from ptychi.utils import (
 
 from utils import (
     center_crop_or_pad,
+    collect_rpi_params,
     fourier_resample,
     fourier_upsample_object,
     make_disk_probe,
+    make_rpi_recon_dir_name,
     probe_fourier_radius,
     rescale_probe_to_counts,
     rpi_diffraction_loss,
+    save_initial_conditions,
+    save_rpi_reconstruction,
     siemens_star,
     simulate_rpi_diffraction,
 )
@@ -106,20 +110,24 @@ probe_diameter_m = 3.5e-6        # only used when no probe comes from init_recon
 # is the theoretical limit. Here kp ~ 87 px, so R = 0.5 gives an 88 px object at
 # ~102 nm pitch -- the same regime as the paper's own X-ray demo (70 px, 83 nm).
 # The 30 nm Siemens star features are below this limit and cannot be recovered.
-rpi_resolution_ratio = 0.5
+rpi_resolution_ratio = 1000
 rpi_kp_quantile = 0.95           # fraction of probe far-field power used to define kp
 
 # --- optimizer --------------------------------------------------------------
-num_epochs = 3000                # max Adam iterations per restart
+rpi_optimizer_cls = torch.optim.Adam
+num_epochs = 3000                # max optimizer iterations per restart
 rpi_lr = 0.01                    # Adam step on an object of magnitude ~1
 rpi_lr_decay_factor = 0.5
-rpi_lr_decay_patience = 100      # iters without improvement before cutting lr
+rpi_lr_decay_patience = 100      # if loss doesn't improve for this many epochs, decay lr*0.5
 rpi_min_lr = 1e-5                # stop when lr decays below this
 rpi_loss_floor = 1e-9            # stop when loss falls below this
 rpi_num_restarts = 1             # measured: the solution is init-independent here
 rpi_object_init = "unit"         # "unit" (1 + noise, a transmission object) or "random" (paper)
 rpi_init_sigma = 0.1             # init noise std ("random" uses 1.0 per the paper)
 rpi_background_counts = 0.0      # known detector background (Eq. 2's B_ij), if any
+
+# --- saving -------------------------------------------------------------
+save_freq_iterations = 500       # write a recon_Niter*.h5 snapshot every N epochs (per restart)
 
 # --- staged probe update ----------------------------------------------------
 # Set rpi_probe_start = 200 to freeze the probe for 200 iterations and then refine it.
@@ -130,7 +138,7 @@ rpi_background_counts = 0.0      # known detector background (Eq. 2's B_ij), if 
 # The Poisson noise floor is 0.0124, so every released run fits noise, and none improves
 # the object. Default off. Useful only if the probe may have drifted between the
 # calibration scan and the shot -- it has not here.
-rpi_probe_start = 100
+rpi_probe_start = 10
 rpi_probe_lr_rel = 0.003         # probe lr = this * mean|P| (probe entries are ~1e-3)
 rpi_probe_anchor = 3.0           # weight of ||P - P0||^2 / ||P0||^2 keeping P near calibration
 
@@ -301,6 +309,14 @@ print(
 if achieved_R > 0.6:
     print(f"  WARNING: R = {achieved_R:.2f} exceeds the paper's reliable range (<= 0.6)")
 
+# Output folder, in the same out_dir/scan/<tag>/ layout the Pty-Chi scripts use --
+# see make_rpi_recon_dir_name for the tag (no shared LSQML/Pty-Chi knobs apply here).
+recon_dir = out_dir / scan / make_rpi_recon_dir_name(
+    recon_dir_suffix, optimizer_name=rpi_optimizer_cls.__name__
+)
+save_initial_conditions(recon_dir, params=collect_rpi_params(), positions_px=positions_px_all,
+                        params_filename="rpi_params.json")
+
 # Illuminated field of view: object pixels outside it are not constrained by the data.
 illumination = (probe_modes.abs() ** 2).sum(0)
 illumination = (illumination / illumination.max()).cpu().numpy()
@@ -317,6 +333,88 @@ print(
 # reconstruction should land NEAR this, not far below it -- below means it is fitting noise.
 noise_floor = float((mask.sum() / 4) / (measured * mask).sum())
 print(f"  Poisson noise floor of the loss ~ {noise_floor:.5f}")
+
+
+#%% ---------------------------------------------------------------- initial guess
+
+torch.manual_seed(random_seed)
+noise = torch.randn(n_obj_lowres, n_obj_lowres, dtype=torch.float32, device=torch_device) \
+    + 1j * torch.randn(n_obj_lowres, n_obj_lowres, dtype=torch.float32, device=torch_device)
+if rpi_object_init == "random":                # the paper's init (its objects were random)
+    obj_lowres = rpi_init_sigma * noise
+else:                                          # a transmission object sits near 1
+    obj_lowres = torch.ones_like(noise) + rpi_init_sigma * noise
+obj_lowres = obj_lowres.to(get_default_complex_dtype()).requires_grad_(True)
+
+# Initial guess, before any optimization.
+obj_lowres_init_np = obj_lowres.detach().cpu().numpy()
+fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+axes[0].imshow(np.abs(obj_lowres_init_np), cmap="gray")
+axes[0].set_title("initial object magnitude")
+axes[1].imshow(np.angle(obj_lowres_init_np), cmap="gray")
+axes[1].set_title("initial object phase")
+for ax in axes:
+    ax.set_aspect("equal")
+plt.tight_layout()
+plt.show()
+
+
+#%% ---------------------------------------------------------------- band-limit geometry
+
+# Band-limit geometry in reciprocal space, overlaid on the actual far-field content: kp is a
+# circular (isotropic) quantile of the probe's Fourier power, but n_obj_lowres actually crops
+# the object's spectrum to a SQUARE box (fourier_upsample_object pads/crops a centered block,
+# no radial mask) -- so the enforced cutoff reaches further out along the diagonals than a
+# true disk of radius ko = R * kp would. Grayscale, full frame: the probe's own far field --
+# what kp is measured against. Inferno, inset at the scale fourier_upsample_object embeds it
+# at: the initial object's own spectrum -- what n_obj_lowres actually keeps (mostly a DC spike
+# plus a flat noise floor before any optimization, since the initial guess carries no real
+# structure yet).
+ko = n_obj_lowres / 2
+probe_far = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, -1))) ** 2) \
+    .sum(0).cpu().numpy()
+obj_far = np.abs(np.fft.fftshift(np.fft.fft2(obj_lowres_init_np))) ** 2
+
+# Independent floors (in normalized-intensity units, i.e. decades below the peak): the
+# object's initial spectrum is nearly all DC + a flat noise floor (no real structure yet),
+# so it needs a much shallower floor than the probe to show that floor as texture instead
+# of crushing the whole square to one inferno color.
+probe_log_floor = 1e-4
+obj_log_floor = 1e-3
+probe_far_n = np.maximum(probe_far / probe_far.max(), probe_log_floor)
+obj_far_n = np.maximum(obj_far / obj_far.max(), obj_log_floor)
+
+n_half = n_dp / 2
+fig, ax = plt.subplots(figsize=(6.5, 5.5))
+im_probe = ax.imshow(np.log10(probe_far_n), cmap="gray", origin="lower",
+                     vmin=np.log10(probe_log_floor), vmax=0,
+                     extent=[-n_half, n_half, -n_half, n_half])
+im_obj = ax.imshow(np.log10(obj_far_n), cmap="inferno", origin="lower", alpha=0.8,
+                   vmin=np.log10(obj_log_floor), vmax=0, extent=[-ko, ko, -ko, ko])
+fig.colorbar(im_probe, ax=ax, location="right", fraction=0.046, pad=0.04,
+            label="probe log10(I / I_max)")
+cbar_obj = fig.colorbar(im_obj, ax=ax, location="right", fraction=0.046, pad=0.15,
+                        label="object log10(I / I_max)")
+cbar_obj.ax.yaxis.set_ticks_position("left")
+cbar_obj.ax.yaxis.set_label_position("left")
+ax.add_patch(plt.Circle((0, 0), kp, fill=False, color="C0", lw=1.5,
+                        label=f"kp = {kp} px  (circle, {rpi_kp_quantile:g} quantile)"))
+ax.add_patch(plt.Rectangle((-kp, -kp), 2 * kp, 2 * kp, fill=False, color="C1", lw=1.5,
+                           label=f"2kp x 2kp = {2 * kp} px  (circumscribing box)"))
+ax.add_patch(plt.Rectangle((-ko, -ko), 2 * ko, 2 * ko, fill=False, color="C2", lw=2,
+                           label=f"2ko x 2ko = {n_obj_lowres} px  (n_obj_lowres, R = {achieved_R:.2f})"))
+lim = 2 * kp
+ax.set_xlim(-lim, lim)
+ax.set_ylim(-lim, lim)
+ax.set_aspect("equal")
+ax.axhline(0, color="0.85", lw=0.5, zorder=0)
+ax.axvline(0, color="0.85", lw=0.5, zorder=0)
+ax.set_xlabel("kx [detector px]")
+ax.set_ylabel("ky [detector px]")
+ax.set_title("RPI band-limit geometry in reciprocal space")
+ax.legend(fontsize=8, loc="upper right")
+plt.tight_layout()
+plt.show()
 
 
 #%% ---------------------------------------------------------------- run
@@ -341,7 +439,7 @@ for restart in range(rpi_num_restarts):
     groups = [{"params": [obj_lowres], "lr": rpi_lr}]
     if probe_optimizable:
         groups.append({"params": [probe_var], "lr": probe_lr})
-    optimizer = torch.optim.Adam(groups)
+    optimizer = rpi_optimizer_cls(groups)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=rpi_lr_decay_factor, patience=rpi_lr_decay_patience
     )
@@ -371,6 +469,18 @@ for restart in range(rpi_num_restarts):
         if epoch % 20 == 0 or epoch == num_epochs - 1:
             bar.set_postfix(loss=f"{losses[-1]:.5f}", floor=f"{noise_floor:.5f}",
                             lr=f"{lr_now:.2e}", probe="on" if probe_live else "off")
+
+        if save_freq_iterations and (epoch + 1) % save_freq_iterations == 0:
+            # Separate subfolder per restart only when there is more than one, so their
+            # same-numbered checkpoints don't collide; the default single-restart case
+            # writes straight into recon_dir, matching the LSQML scripts' flat layout.
+            snap_dir = recon_dir / f"restart{restart}" if rpi_num_restarts > 1 else recon_dir
+            with torch.no_grad():
+                snap_fullres = fourier_upsample_object(obj_lowres, n_dp)
+            save_rpi_reconstruction(obj_lowres, snap_fullres, probe_now, losses, snap_dir,
+                                    epoch + 1, pixel_size_m=pixel_size_m,
+                                    object_pixel_size_m=object_pixel_size_m)
+
         if losses[-1] < rpi_loss_floor or lr_now < rpi_min_lr:
             break
     bar.close()
@@ -427,7 +537,7 @@ axes[1].set_title("low-res object phase")
 for ax in axes[:2]:
     ax.set_xticks([]), ax.set_yticks([])
 axes[2].semilogy(best_losses, label="diffraction loss")
-axes[2].axhline(noise_floor, color="red", ls="--", lw=1, label=f"Poisson floor {noise_floor:.4f}")
+# axes[2].axhline(noise_floor, color="red", ls="--", lw=1, label=f"Poisson floor {noise_floor:.4f}")
 if probe_optimizable:
     axes[2].axvline(rpi_probe_start, color="0.5", ls=":", lw=1, label="probe released")
 axes[2].set_xlabel("iteration"), axes[2].set_ylabel("loss")
@@ -439,26 +549,18 @@ plt.show()
 
 #%% ---------------------------------------------------------------- save
 
-out_dir.mkdir(parents=True, exist_ok=True)
-out_file = out_dir / f"recon_frame{frame_index}_RPI_R{achieved_R:.2f}_{n_obj_lowres}px.h5"
-
-with h5py.File(out_file, "w") as f:
-    f.create_dataset("object_lowres", data=obj_lowres_np)
-    # Full-resolution (Fourier-upsampled) object, kept under this name for
-    # compatibility with init_recon_file's prior["object"] loader.
-    f.create_dataset("object", data=obj_fullres_np)
-    f.create_dataset("probe", data=recon_probe_np)
-    f.create_dataset("illumination", data=illumination.astype(np.float32))
-    f.create_dataset("positions_px", data=position_px[None, :])
-    f.attrs["pixel_size_m"] = pixel_size_m
-    f.attrs["object_pixel_size_m"] = object_pixel_size_m
-    f.attrs["wavelength_m"] = wavelength_m
-    f.attrs["detector_distance_m"] = det_dist_m
-    f.attrs["rpi_resolution_ratio"] = achieved_R
-    f.attrs["probe_fourier_radius_px"] = kp
-    f.attrs["noise_floor"] = noise_floor
-    f.attrs["final_loss"] = best_loss
-    f.attrs["frame_index"] = frame_index
-
-np.savetxt(out_dir / "rpi_loss.csv", best_losses, delimiter=",", header="loss", comments="")
-print(f"saved {out_file}")
+save_rpi_reconstruction(
+    obj_lowres, obj_fullres, recon_probe, best_losses, recon_dir,
+    pixel_size_m=pixel_size_m, object_pixel_size_m=object_pixel_size_m,
+    position_px=position_px[None, :], illumination=illumination.astype(np.float32),
+    extra_attrs={
+        "wavelength_m": wavelength_m,
+        "detector_distance_m": det_dist_m,
+        "rpi_resolution_ratio": achieved_R,
+        "probe_fourier_radius_px": kp,
+        "noise_floor": noise_floor,
+        "final_loss": best_loss,
+        "frame_index": frame_index,
+    },
+)
+print(f"results in {recon_dir}")
