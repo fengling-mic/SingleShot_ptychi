@@ -18,6 +18,19 @@
 # spatial frequency (utils.probe_fourier_radius). Sizing it against the detector's
 # Nyquist frequency instead silently runs at R ~ 1.5 here, far past the paper's
 # reliability limit of ~0.6, and the reconstruction then just fits shot noise.
+#
+# This _blrelax variant does not hold the band limit fixed: outside the window
+# [rpi_relax_start, rpi_relax_end) the object is fully unconstrained (n_obj_lowres =
+# n_dp, no cropping in Fourier space at all); at rpi_relax_start the tight band limit
+# is suddenly applied, and every rpi_relaxation_freq epochs thereafter the object's own
+# grid is grown back out (by re-embedding its current spectrum into a larger
+# zero-padded grid -- lossless at the instant of the grow, it just unlocks a wider
+# annulus of spatial frequencies for the optimizer to fill in next) up to
+# rpi_relax_max_ratio (RPI's ~0.94 theoretical limit -- see module docstring above --
+# reached exactly at rpi_relax_end), at which point it jumps back to fully
+# unconstrained again. The defaults (rpi_relax_start=0, rpi_relax_end=num_epochs) give
+# a tight-from-the-start schedule that never re-enters the unconstrained phase, trading
+# the fast early convergence of a tight band limit for eventual near-full resolution.
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # This makes GPU N appear as GPU 0 to CuPy
@@ -76,7 +89,7 @@ init_recon_file = (
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = ""            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_blrelax"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 frame_index = 62   # index into the loaded scan's patterns/positions to reconstruct
 
@@ -110,8 +123,8 @@ probe_diameter_m = 3.5e-6        # only used when no probe comes from init_recon
 # is the theoretical limit. Here kp ~ 87 px, so R = 0.5 gives an 88 px object at
 # ~102 nm pitch -- the same regime as the paper's own X-ray demo (70 px, 83 nm).
 # The 30 nm Siemens star features are below this limit and cannot be recovered.
-rpi_resolution_ratio = 100
-rpi_kp_quantile = 0.95           # fraction of probe far-field power used to define kp
+rpi_resolution_ratio = 0.4
+rpi_kp_quantile = 0.98           # fraction of probe far-field power used to define kp
 
 # --- optimizer --------------------------------------------------------------
 rpi_optimizer_cls = torch.optim.Adam
@@ -126,8 +139,24 @@ rpi_object_init = "unit"         # "unit" (1 + noise, a transmission object) or 
 rpi_init_sigma = 0.1             # init noise std ("random" uses 1.0 per the paper)
 rpi_background_counts = 0.0      # known detector background (Eq. 2's B_ij), if any
 
+# --- band limit relaxation (this script only) --------------------------------
+# Outside [rpi_relax_start, rpi_relax_end), the object is fully unconstrained
+# (n_obj_lowres = n_dp, no cropping in Fourier space at all). At epoch rpi_relax_start
+# the tight crop (rpi_resolution_ratio-derived) is suddenly applied, then every
+# rpi_relaxation_freq epochs it grows back out -- capped at rpi_relax_max_ratio
+# (n_obj_lowres_cap, RPI's ~0.94 theoretical limit; growing further within the window
+# would only fit noise), reached exactly at rpi_relax_end -- at which point it jumps
+# back to fully unconstrained (n_dp) again. Defaults below (0, num_epochs) reproduce a
+# tight-from-epoch-0 schedule that never re-enters the unconstrained phase. Set
+# rpi_relaxation_freq to None to disable relaxation entirely (fixed band limit, as in
+# the base script).
+rpi_relaxation_freq = 100
+rpi_relax_start = 0
+rpi_relax_end = 1000
+rpi_relax_max_ratio = 0.94   # ceiling achieved_R grows back to WITHIN the relax window
+
 # --- saving -------------------------------------------------------------
-save_freq_iterations = 1000       # write a recon_Niter*.h5 snapshot every N epochs (per restart)
+save_freq_iterations = 2000       # write a recon_Niter*.h5 snapshot every N epochs (per restart)
 
 # --- staged probe update ----------------------------------------------------
 # Set rpi_probe_start = 200 to freeze the probe for 200 iterations and then refine it.
@@ -138,7 +167,7 @@ save_freq_iterations = 1000       # write a recon_Niter*.h5 snapshot every N epo
 # The Poisson noise floor is 0.0124, so every released run fits noise, and none improves
 # the object. Default off. Useful only if the probe may have drifted between the
 # calibration scan and the shot -- it has not here.
-rpi_probe_start = 10
+rpi_probe_start = 100
 rpi_probe_lr_rel = 0.001         # probe lr = this * mean|P| (probe entries are ~1e-3)
 rpi_probe_anchor = 3.0           # weight of ||P - P0||^2 / ||P0||^2 keeping P near calibration
 
@@ -302,12 +331,22 @@ n_obj_lowres = 2 * int(round(rpi_resolution_ratio * kp))
 n_obj_lowres = int(np.clip(n_obj_lowres, 2, n_dp))
 achieved_R = (n_obj_lowres / 2) / kp
 object_pixel_size_m = pixel_size_m * n_dp / n_obj_lowres
+# Ceiling the relaxation schedule grows back out to -- see rpi_relax_max_ratio above:
+# there is never a reason to grow past RPI's ~0.94 theoretical limit, so this (not n_dp)
+# is what "capped-at-max" means everywhere in _schedule_size below.
+n_obj_lowres_cap = 2 * int(round(rpi_relax_max_ratio * kp))
+n_obj_lowres_cap = int(np.clip(n_obj_lowres_cap, 2, n_dp))
 print(
     f"RPI: kp = {kp} px (detector half-width {n_dp // 2}) -> object {n_obj_lowres}x{n_obj_lowres}, "
     f"R = {achieved_R:.2f}, pixel size {object_pixel_size_m * 1e9:.1f} nm, device {torch_device}"
 )
 if achieved_R > 0.6:
     print(f"  WARNING: R = {achieved_R:.2f} exceeds the paper's reliable range (<= 0.6)")
+if rpi_relaxation_freq and rpi_relax_end > rpi_relax_start:
+    print(f"  bandlimit relaxation: capped at {n_obj_lowres_cap} (R = {rpi_relax_max_ratio:g}) "
+          f"before epoch {rpi_relax_start}, cropped to {n_obj_lowres} there, growing every "
+          f"{rpi_relaxation_freq} epochs back to {n_obj_lowres_cap} (R = {rpi_relax_max_ratio:g}) "
+          f"by epoch {rpi_relax_end}")
 
 # Output folder, in the same out_dir/scan/<tag>/ layout the Pty-Chi scripts use --
 # see make_rpi_recon_dir_name for the tag (no shared LSQML/Pty-Chi knobs apply here).
@@ -425,8 +464,75 @@ probe_ref = probe_modes.clone()                    # calibration probe, the anch
 probe_ref_power = (probe_ref.abs() ** 2).sum()
 probe_lr = rpi_probe_lr_rel * probe_ref.abs().mean().item()
 
+# Band limit relaxation schedule: n_obj_lowres/achieved_R/object_pixel_size_m computed
+# above are the tight, INITIAL (cropped) values; n_obj_lowres_cap (also computed above)
+# is the ceiling -- _schedule_size below decides what n_obj_lowres should be at any given
+# epoch (see the knob block for the 3-phase design: capped-at-max -> crop at
+# rpi_relax_start -> grow back to the cap by rpi_relax_end).
+n_obj_lowres_init, achieved_R_init, object_pixel_size_m_init = (
+    n_obj_lowres, achieved_R, object_pixel_size_m
+)
+relax_enabled = bool(rpi_relaxation_freq) and rpi_relax_end > rpi_relax_start
+if relax_enabled:
+    n_relax_events = max((rpi_relax_end - rpi_relax_start) // rpi_relaxation_freq, 1)
+    if rpi_relax_end > num_epochs:
+        print(f"  WARNING: rpi_relax_end={rpi_relax_end} > num_epochs={num_epochs}; "
+              f"the object won't reach the rpi_relax_max_ratio cap before training ends")
+
+
+def _round_even(x):
+    return int(2 * round(x / 2))
+
+
+def _resize_object(obj, n_new):
+    """Bidirectional version of fourier_upsample_object: crop OR zero-pad obj's own FFT
+    to n_new (matching fourier_resample's crop branch for the shrink case). Needed
+    because relaxation must be able to crop the object back down at rpi_relax_start,
+    not just grow it."""
+    n_old = obj.shape[-1]
+    if n_new == n_old:
+        return obj
+    spec = torch.fft.fftshift(torch.fft.fft2(obj, norm="ortho"))
+    if n_new > n_old:
+        out = torch.zeros((n_new, n_new), dtype=spec.dtype, device=spec.device)
+        lo = (n_new - n_old) // 2
+        out[lo : lo + n_old, lo : lo + n_old] = spec
+    else:
+        lo = (n_old - n_new) // 2
+        out = spec[lo : lo + n_new, lo : lo + n_new]
+    return torch.fft.ifft2(torch.fft.ifftshift(out), norm="ortho") * (n_new / n_old)
+
+
+def _schedule_size(epoch):
+    """Target n_obj_lowres just before running epoch `epoch` (0-indexed).
+
+    Caps at n_obj_lowres_cap (rpi_relax_max_ratio), not n_dp: RPI has no reliable signal
+    past R ~ 0.94 (see module docstring), so there's never a reason to grow further,
+    inside the relax window or out. The epoch == rpi_relax_end - 1 branch guarantees the
+    cap is actually reached BY the last epoch of the window even when
+    rpi_relax_end == num_epochs (the loop never visits epoch rpi_relax_end itself, so
+    waiting for that epoch to snap to the cap would otherwise leave the last
+    ~1/n_relax_events of the object permanently cropped)."""
+    if not relax_enabled:
+        return n_obj_lowres_init
+    if epoch < rpi_relax_start:
+        return n_obj_lowres_cap
+    if epoch >= rpi_relax_end - 1:
+        return n_obj_lowres_cap
+    steps = (epoch - rpi_relax_start) // rpi_relaxation_freq
+    frac = min(steps / n_relax_events, 1.0)
+    return _round_even(n_obj_lowres_init + (n_obj_lowres_cap - n_obj_lowres_init) * frac)
+
+
 best_loss, best_obj_lowres, best_probe, best_losses = np.inf, None, None, None
+best_n_obj_lowres, best_achieved_R, best_object_pixel_size_m = None, None, None
+best_relax_history = None
 for restart in range(rpi_num_restarts):
+    n_obj_lowres = _schedule_size(0)
+    achieved_R = (n_obj_lowres / 2) / kp
+    object_pixel_size_m = pixel_size_m * n_dp / n_obj_lowres
+    relax_history = [(0, n_obj_lowres)]
+
     torch.manual_seed(random_seed + restart)
     noise = torch.randn(n_obj_lowres, n_obj_lowres, dtype=torch.float32, device=torch_device) \
         + 1j * torch.randn(n_obj_lowres, n_obj_lowres, dtype=torch.float32, device=torch_device)
@@ -448,6 +554,26 @@ for restart in range(rpi_num_restarts):
     losses = []
     bar = tqdm(range(num_epochs), desc=f"restart {restart + 1}/{rpi_num_restarts}", leave=True)
     for epoch in bar:
+        target = _schedule_size(epoch)
+        if target != n_obj_lowres:
+            # Re-embed the object's own (unchanged) spectrum into a differently-sized
+            # zero-padded/cropped grid. Growing is lossless right now (just unlocks a wider
+            # annulus of spatial frequencies for the optimizer to fill in); cropping DISCARDS
+            # whatever high-k content the object picked up while unconstrained, so expect a
+            # loss jump there, unlike the smooth grow steps. Either way obj_lowres becomes a
+            # new leaf tensor, so it must replace the old one in the optimizer's param group;
+            # Adam lazily reinitializes (zeroed) state for it on its next step, which is the
+            # desired reset -- no state carries over by shape.
+            with torch.no_grad():
+                obj_lowres = _resize_object(obj_lowres, target).requires_grad_(True)
+            optimizer.param_groups[0]["params"] = [obj_lowres]
+            prev_n_obj_lowres = n_obj_lowres
+            n_obj_lowres, achieved_R = target, (target / 2) / kp
+            object_pixel_size_m = pixel_size_m * n_dp / n_obj_lowres
+            relax_history.append((epoch, n_obj_lowres))
+            bar.write(f"  epoch {epoch}: {'grew' if target > prev_n_obj_lowres else 'cropped'} "
+                      f"n_obj_lowres {prev_n_obj_lowres} -> {n_obj_lowres} (R = {achieved_R:.2f})")
+
         probe_live = probe_optimizable and epoch >= rpi_probe_start
         probe_now = probe_var if probe_live else probe_ref
 
@@ -468,8 +594,8 @@ for restart in range(rpi_num_restarts):
         scheduler.step(losses[-1])
         lr_now = optimizer.param_groups[0]["lr"]
         if epoch % 20 == 0 or epoch == num_epochs - 1:
-            bar.set_postfix(loss=f"{losses[-1]:.5f}", floor=f"{noise_floor:.5f}",
-                            lr=f"{lr_now:.2e}", probe="on" if probe_live else "off")
+            bar.set_postfix(loss=f"{losses[-1]:.5f}", floor=f"{noise_floor:.5f}", lr=f"{lr_now:.2e}",
+                            probe="on" if probe_live else "off", nobj=n_obj_lowres)
 
         if save_freq_iterations and (epoch + 1) % save_freq_iterations == 0:
             # Separate subfolder per restart only when there is more than one, so their
@@ -493,9 +619,16 @@ for restart in range(rpi_num_restarts):
         best_obj_lowres = obj_lowres.detach().clone()
         best_probe = probe_var.detach().clone()
         best_losses = losses
+        best_n_obj_lowres, best_achieved_R, best_object_pixel_size_m = (
+            n_obj_lowres, achieved_R, object_pixel_size_m
+        )
+        best_relax_history = relax_history
 
 obj_lowres = best_obj_lowres
 recon_probe = best_probe
+n_obj_lowres, achieved_R, object_pixel_size_m = (
+    best_n_obj_lowres, best_achieved_R, best_object_pixel_size_m
+)
 obj_fullres = fourier_upsample_object(obj_lowres, n_dp).detach()
 obj_lowres_np = obj_lowres.cpu().numpy()
 obj_fullres_np = obj_fullres.cpu().numpy()
@@ -537,13 +670,25 @@ axes[1].imshow(np.angle(obj_lowres_np), cmap="gray")
 axes[1].set_title("low-res object phase")
 for ax in axes[:2]:
     ax.set_xticks([]), ax.set_yticks([])
-axes[2].semilogy(best_losses, label="diffraction loss")
+line_loss, = axes[2].semilogy(best_losses, label="diffraction loss")
 # axes[2].axhline(noise_floor, color="red", ls="--", lw=1, label=f"Poisson floor {noise_floor:.4f}")
+handles = [line_loss]
 if probe_optimizable:
-    axes[2].axvline(rpi_probe_start, color="0.5", ls=":", lw=1, label="probe released")
+    handles.append(axes[2].axvline(rpi_probe_start, color="0.5", ls=":", lw=1,
+                                   label="probe released"))
 axes[2].set_xlabel("iteration"), axes[2].set_ylabel("loss")
 axes[2].set_title(f"R = {achieved_R:.2f}, final {best_loss:.5f}")
-axes[2].legend(fontsize=7)
+if rpi_relaxation_freq and len(best_relax_history) > 1:
+    # Overlay the band-limit relaxation schedule against the loss, to see whether
+    # growing the object grid costs a bump in loss or is absorbed smoothly.
+    relax_epochs, relax_sizes = zip(*best_relax_history)
+    ax_relax = axes[2].twinx()
+    line_relax, = ax_relax.step(relax_epochs, relax_sizes, where="post", color="C2", lw=1.2,
+                                label="2ko")
+    ax_relax.set_ylabel("2ko [px]", color="C2")
+    ax_relax.tick_params(axis="y", colors="C2")
+    handles.append(line_relax)
+axes[2].legend(handles=handles, fontsize=7)
 plt.tight_layout()
 plt.show()
 
@@ -562,6 +707,11 @@ save_rpi_reconstruction(
         "noise_floor": noise_floor,
         "final_loss": best_loss,
         "frame_index": frame_index,
+        "rpi_relaxation_freq": rpi_relaxation_freq or 0,
+        "relax_schedule_epochs": np.asarray([e for e, _ in best_relax_history], dtype=np.int64),
+        "relax_schedule_n_obj_lowres": np.asarray(
+            [n for _, n in best_relax_history], dtype=np.int64
+        ),
     },
 )
 print(f"results in {recon_dir}")

@@ -4,20 +4,15 @@
 # from the 12-ID-C Siemens star scan, following Levitan et al., "Single-frame far-field
 # diffractive imaging with randomized illumination," Opt. Express 28, 37103 (2020).
 #
-# Forward model (their Eq. 1):  E~ = F{ P . F^-1{ pad(F{O'}) } }
-# The object O' lives on a grid COARSER than the probe/detector (band-limited), and is
-# upsampled to full resolution by zero-padding its own Fourier transform. It is optimized
-# directly with PyTorch autodiff + Adam against the single measured pattern; there is no
-# Pty-Chi Task/task.run() here because Pty-Chi's forward model always keeps object and
-# probe on the same pixel grid and cannot express the band limit. The probe comes from a
-# prior multi-position Pty-Chi reconstruction (init_recon_file) and is held fixed, as in
-# the paper -- see rpi_probe_start to release it.
-#
-# The size of the low-res object is set by the PROBE's numerical aperture, not by the
-# detector: the paper's resolution ratio is R = ko/kp where kp is the probe's maximum
-# spatial frequency (utils.probe_fourier_radius). Sizing it against the detector's
-# Nyquist frequency instead silently runs at R ~ 1.5 here, far past the paper's
-# reliability limit of ~0.6, and the reconstruction then just fits shot noise.
+# Forward model (their Eq. 1): E~ = F{ P . F^-1{ pad(F{O}) } }
+# The object is optimized directly with PyTorch autodiff + Adam against the single
+# measured pattern; there is no Pty-Chi Task/task.run() here, so the probe can be held
+# fixed exactly as in the paper. By default (rpi_object_init != "esw") the object is at
+# full detector resolution and pad(...) is a no-op; with rpi_object_init == "esw" it is
+# additionally band-limited against the probe's own Fourier support (see "RPI setup" and
+# rpi_resolution_ratio/rpi_kp_quantile below) and zero-padded back up to full resolution.
+# The probe comes from a prior multi-position Pty-Chi reconstruction (init_recon_file)
+# and is held fixed -- see rpi_probe_start to release it.
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # This makes GPU N appear as GPU 0 to CuPy
@@ -76,7 +71,7 @@ init_recon_file = (
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = ""            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_esw"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 frame_index = 62   # index into the loaded scan's patterns/positions to reconstruct
 
@@ -104,13 +99,12 @@ n_probe_modes = 10             # None = keep every incoherent mode in the prior 
 n_opr_modes = 1                  # a single frame carries no probe-variation information
 probe_diameter_m = 3.5e-6        # only used when no probe comes from init_recon_file
 
-# --- band limit -------------------------------------------------------------
-# R = ko/kp, measured against the probe's own Fourier support (NOT the detector).
-# The paper: R < 0.4 "virtually guaranteed to succeed", R <= 0.6 workable, R ~ 0.94
-# is the theoretical limit. Here kp ~ 87 px, so R = 0.5 gives an 88 px object at
-# ~102 nm pitch -- the same regime as the paper's own X-ray demo (70 px, 83 nm).
-# The 30 nm Siemens star features are below this limit and cannot be recovered.
-rpi_resolution_ratio = 100
+# --- band limit (ESW init only) ----------------------------------------------------
+# R = ko/kp, measured against the probe's own Fourier support. Applies only when
+# rpi_object_init == "esw": the ESW/PRL estimate's real information is limited to what
+# the probe's numerical aperture can resolve, so in that mode the optimization itself is
+# also constrained to that resolution (see "RPI setup" below). Unused otherwise.
+rpi_resolution_ratio = 0.5
 rpi_kp_quantile = 0.95           # fraction of probe far-field power used to define kp
 
 # --- optimizer --------------------------------------------------------------
@@ -122,12 +116,12 @@ rpi_lr_decay_patience = 100      # if loss doesn't improve for this many epochs,
 rpi_min_lr = 1e-5                # stop when lr decays below this
 rpi_loss_floor = 1e-9            # stop when loss falls below this
 rpi_num_restarts = 1             # measured: the solution is init-independent here
-rpi_object_init = "unit"         # "unit" (1 + noise, a transmission object) or "random" (paper)
+rpi_object_init = "esw"          # "esw" (known-illumination ER estimate + noise), "unit" (1 + noise), or "random" (paper)
 rpi_init_sigma = 0.1             # init noise std ("random" uses 1.0 per the paper)
 rpi_background_counts = 0.0      # known detector background (Eq. 2's B_ij), if any
 
 # --- saving -------------------------------------------------------------
-save_freq_iterations = 1000       # write a recon_Niter*.h5 snapshot every N epochs (per restart)
+save_freq_iterations = 2000       # write a recon_Niter*.h5 snapshot every N epochs (per restart)
 
 # --- staged probe update ----------------------------------------------------
 # Set rpi_probe_start = 200 to freeze the probe for 200 iterations and then refine it.
@@ -293,30 +287,6 @@ measured = torch.as_tensor(patterns[0], dtype=torch.float32, device=torch_device
 mask = torch.as_tensor(det_mask.astype(np.float32), device=torch_device)
 probe_modes = rescale_probe_to_counts(probe[0].to(torch_device), measured, mask)
 
-# Band limit, defined against the probe's numerical aperture (see module docstring).
-assert n_dp % 2 == 0, "n_dp must be even so that n_dp - n_obj_lowres stays even"
-kp = probe_fourier_radius(probe_modes, rpi_kp_quantile)
-# n_obj_lowres is forced even, which keeps the zero-padding in fourier_upsample_object
-# symmetric; an odd total pad puts DC one bin off and corrupts the whole upsampled array.
-n_obj_lowres = 2 * int(round(rpi_resolution_ratio * kp))
-n_obj_lowres = int(np.clip(n_obj_lowres, 2, n_dp))
-achieved_R = (n_obj_lowres / 2) / kp
-object_pixel_size_m = pixel_size_m * n_dp / n_obj_lowres
-print(
-    f"RPI: kp = {kp} px (detector half-width {n_dp // 2}) -> object {n_obj_lowres}x{n_obj_lowres}, "
-    f"R = {achieved_R:.2f}, pixel size {object_pixel_size_m * 1e9:.1f} nm, device {torch_device}"
-)
-if achieved_R > 0.6:
-    print(f"  WARNING: R = {achieved_R:.2f} exceeds the paper's reliable range (<= 0.6)")
-
-# Output folder, in the same out_dir/scan/<tag>/ layout the Pty-Chi scripts use --
-# see make_rpi_recon_dir_name for the tag (no shared LSQML/Pty-Chi knobs apply here).
-recon_dir = out_dir / scan / make_rpi_recon_dir_name(
-    recon_dir_suffix, optimizer_name=rpi_optimizer_cls.__name__
-)
-save_initial_conditions(recon_dir, params=collect_rpi_params(), positions_px=positions_px_all,
-                        params_filename="rpi_params.json")
-
 # Illuminated field of view: object pixels outside it are not constrained by the data.
 illumination = (probe_modes.abs() ** 2).sum(0)
 illumination = (illumination / illumination.max()).cpu().numpy()
@@ -337,11 +307,141 @@ print(f"  Poisson noise floor of the loss ~ {noise_floor:.5f}")
 
 #%% ---------------------------------------------------------------- initial guess
 
+# PRL-style per-position ESW estimate: Williams et al., "Fresnel Coherent Diffractive
+# Imaging," Phys. Rev. Lett. 97, 025506 (2006), Eq. (3). Iterate
+#
+#     rho_{k+1} = F^-1[ M( F[rho_k] + Psi_inc ) - Psi_inc ]
+#
+# where rho = T.psi_inc is the object-induced perturbation of the exit wave (rho_0 = 0,
+# i.e. "no object yet"), Psi_inc = F[psi_inc] is the known illumination's own far field
+# (precomputed once), and M enforces the measured modulus at valid detector pixels,
+# leaving the current estimate alone at dead/stuck pixels. Unlike a single Wiener
+# division, this iterates the actual modulus constraint against the measured data, so it
+# isn't limited to a weak-object approximation.
+#
+# CAVEAT: this omits the paper's real-space support constraint (pi_s in their Eq. 1/3).
+# Their support -- the isolated gold sample surrounded by vacuum -- is what gave plain ER
+# its resistance to the twin image and its clean, ~30-iteration convergence. The Siemens
+# star fills the field of view with no equivalent vacuum region, so there's nothing
+# physically correct to threshold to zero. What's left is the known-illumination modulus
+# trick alone -- still legitimate, since the paper credits the curved/structured
+# illumination itself (not the support) with making the solution unique -- but expect
+# noisier, slower convergence than the paper reports, and no protection against
+# stagnation or the twin image.
+#
+# Same function used to seed the multi-position reconstruction in
+# ptychi_reconstruction_siemensStar_esw.py, called here with this script's single
+# measured pattern only (n_pos=1) -- no other scan position's data enters the seed,
+# keeping the reconstruction genuinely single-shot. With one position the |P|^2-weighted
+# stitch degenerates to a single placement, so the returned canvas is n_dp x n_dp; it is
+# then cropped down to n_obj_lowres (fourier_resample, the inverse of
+# fourier_upsample_object's zero-padding) to match the band limit computed right below,
+# after this estimate exists, since this init mode is what that band limit exists for.
+def esw_object_prl(
+    patterns, probe_2d, positions_px, object_shape, valid_pixel_mask,
+    n_iterations=1000, batch_size=32, verbose=True,
+):
+    """Per-position ESW estimate via known-illumination ER (no support constraint)."""
+    torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+    P = torch.as_tensor(np.asarray(probe_2d, dtype=np.complex64), device=torch_device)
+    n = P.shape[-1]
+    Psi_inc = torch.fft.fft2(P)  # illumination's own far field, precomputed once
+    keep = torch.as_tensor(np.fft.ifftshift(valid_pixel_mask), device=torch_device)
+
+    p_conj = torch.conj(P)
+    p_sq = P.abs() ** 2
+    eps = 1e-3 * p_sq.max()
+    cy, cx = object_shape[0] // 2, object_shape[1] // 2
+
+    num = torch.zeros(object_shape, dtype=torch.complex64, device=torch_device)
+    den = torch.zeros(object_shape, dtype=torch.float32, device=torch_device)
+
+    n_pos = len(positions_px)
+    err_num, err_den = 0.0, 0.0
+    for start in range(0, n_pos, batch_size):
+        sl = slice(start, start + batch_size)
+        batch_patterns = np.fft.ifftshift(patterns[sl], axes=(-2, -1)).astype(np.float32)
+        target_amp = torch.sqrt(
+            torch.clamp(torch.as_tensor(batch_patterns, device=torch_device), min=0)
+        )
+        b = target_amp.shape[0]
+        rho = torch.zeros((b, n, n), dtype=torch.complex64, device=torch_device)
+
+        for _ in range(n_iterations):
+            far = torch.fft.fft2(rho) + Psi_inc  # (i) propagate, (ii) add illumination
+            amp = far.abs()
+            corrected = torch.where(
+                amp > 1e-12, target_amp * far / amp, target_amp.to(far.dtype)
+            )
+            far = torch.where(keep, corrected, far)  # (iii) modulus at valid pixels only
+            rho = torch.fft.ifft2(far - Psi_inc)      # (iv) subtract illum., (v) backpropagate
+
+        # Track a chi^2-like relative modulus error (paper's Eq. 2) for convergence sanity.
+        far_final = (torch.fft.fft2(rho) + Psi_inc).abs()
+        err_num += (((far_final - target_amp) ** 2) * keep).sum().item()
+        err_den += ((target_amp ** 2) * keep).sum().item()
+
+        pos_batch = positions_px[sl]
+        for i in range(b):
+            pos_y, pos_x = pos_batch[i]
+            r0 = int(round(cy + pos_y - n / 2))
+            c0 = int(round(cx + pos_x - n / 2))
+            num[r0 : r0 + n, c0 : c0 + n] += rho[i] * p_conj
+            den[r0 : r0 + n, c0 : c0 + n] += p_sq
+
+    if verbose:
+        print(f"ESW/PRL seed: relative modulus chi^2 after {n_iterations} iters "
+              f"= {err_num / err_den:.4e}")
+
+    est = num / (den + eps)
+    lit = den > 0.01 * den.max()
+    est = est / torch.median(est[lit].abs())
+    est = torch.where(lit, est, torch.ones_like(est))
+    return est.cpu().numpy().astype(np.complex64)
+
+
+esw_seed_fullres = esw_object_prl(patterns, probe_modes[0].cpu().numpy(), np.zeros((1, 2)),
+                                   (n_dp, n_dp), det_mask)
+
+if rpi_object_init == "esw":
+    # Band limit, defined against the probe's numerical aperture (see module docstring).
+    assert n_dp % 2 == 0, "n_dp must be even so that n_dp - n_obj_lowres stays even"
+    kp = probe_fourier_radius(probe_modes, rpi_kp_quantile)
+    n_obj_lowres = 2 * int(round(rpi_resolution_ratio * kp))
+    n_obj_lowres = int(np.clip(n_obj_lowres, 2, n_dp))
+    achieved_R = (n_obj_lowres / 2) / kp
+    object_pixel_size_m = pixel_size_m * n_dp / n_obj_lowres
+    print(f"RPI: kp = {kp} px (detector half-width {n_dp // 2}) -> object {n_obj_lowres}x{n_obj_lowres}, "
+          f"R = {achieved_R:.2f}, pixel size {object_pixel_size_m * 1e9:.1f} nm, device {torch_device}")
+    if achieved_R > 0.6:
+        print(f"  WARNING: R = {achieved_R:.2f} exceeds the paper's reliable range (<= 0.6)")
+else:
+    kp, achieved_R = None, None
+    n_obj_lowres = n_dp
+    object_pixel_size_m = pixel_size_m
+    print(f"RPI: object {n_obj_lowres}x{n_obj_lowres}, pixel size {object_pixel_size_m * 1e9:.1f} nm, "
+          f"device {torch_device}")
+
+# Output folder, in the same out_dir/scan/<tag>/ layout the Pty-Chi scripts use --
+# see make_rpi_recon_dir_name for the tag (no shared LSQML/Pty-Chi knobs apply here).
+recon_dir = out_dir / scan / make_rpi_recon_dir_name(
+    recon_dir_suffix, optimizer_name=rpi_optimizer_cls.__name__
+)
+save_initial_conditions(recon_dir, params=collect_rpi_params(), positions_px=positions_px_all,
+                        params_filename="rpi_params.json")
+
+esw_seed = torch.as_tensor(
+    fourier_resample(esw_seed_fullres, n_obj_lowres),
+    dtype=get_default_complex_dtype(), device=torch_device,
+)
+
 torch.manual_seed(random_seed)
 noise = torch.randn(n_obj_lowres, n_obj_lowres, dtype=torch.float32, device=torch_device) \
     + 1j * torch.randn(n_obj_lowres, n_obj_lowres, dtype=torch.float32, device=torch_device)
 if rpi_object_init == "random":                # the paper's init (its objects were random)
     obj_lowres = rpi_init_sigma * noise
+elif rpi_object_init == "esw":                 # known-illumination ER estimate (see above)
+    obj_lowres = esw_seed + rpi_init_sigma * noise
 else:                                          # a transmission object sits near 1
     obj_lowres = torch.ones_like(noise) + rpi_init_sigma * noise
 obj_lowres = obj_lowres.to(get_default_complex_dtype()).requires_grad_(True)
@@ -359,65 +459,6 @@ plt.tight_layout()
 plt.show()
 
 
-#%% ---------------------------------------------------------------- band-limit geometry
-
-# Band-limit geometry in reciprocal space, overlaid on the actual far-field content: kp is a
-# circular (isotropic) quantile of the probe's Fourier power, but n_obj_lowres actually crops
-# the object's spectrum to a SQUARE box (fourier_upsample_object pads/crops a centered block,
-# no radial mask) -- so the enforced cutoff reaches further out along the diagonals than a
-# true disk of radius ko = R * kp would. Grayscale, full frame: the probe's own far field --
-# what kp is measured against. Inferno, inset at the scale fourier_upsample_object embeds it
-# at: the initial object's own spectrum -- what n_obj_lowres actually keeps (mostly a DC spike
-# plus a flat noise floor before any optimization, since the initial guess carries no real
-# structure yet).
-ko = n_obj_lowres / 2
-probe_far = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, -1))) ** 2) \
-    .sum(0).cpu().numpy()
-obj_far = np.abs(np.fft.fftshift(np.fft.fft2(obj_lowres_init_np))) ** 2
-
-# Independent floors (in normalized-intensity units, i.e. decades below the peak): the
-# object's initial spectrum is nearly all DC + a flat noise floor (no real structure yet),
-# so it needs a much shallower floor than the probe to show that floor as texture instead
-# of crushing the whole square to one inferno color.
-probe_log_floor = 1e-3
-obj_log_floor = 1e-1
-probe_far_n = np.maximum(probe_far / probe_far.max(), probe_log_floor)
-obj_far_n = np.maximum(obj_far / obj_far.max(), obj_log_floor)
-
-n_half = n_dp / 2
-fig, ax = plt.subplots(figsize=(6.5, 5.5))
-im_probe = ax.imshow(np.log10(probe_far_n), cmap="gray", origin="lower",
-                     vmin=np.log10(probe_log_floor), vmax=0,
-                     extent=[-n_half, n_half, -n_half, n_half])
-# im_obj = ax.imshow(np.log10(obj_far_n), cmap="inferno", origin="lower", alpha=0.8,
-#                    vmin=np.log10(obj_log_floor), vmax=0, extent=[-ko, ko, -ko, ko])
-fig.colorbar(im_probe, ax=ax, location="right", fraction=0.046, pad=0.04,
-            label="probe log10(I / I_max)")
-# cbar_obj = fig.colorbar(im_obj, ax=ax, location="right", fraction=0.046, pad=0.15,
-#                         label="object log10(I / I_max)")
-# cbar_obj.ax.yaxis.set_ticks_position("left")
-# cbar_obj.ax.yaxis.set_label_position("left")
-ax.add_patch(plt.Circle((0, 0), kp, fill=False, color="C0", lw=1.5,
-                        label=f"kp = {kp} px  (circle, {rpi_kp_quantile:g} quantile)"))
-ax.add_patch(plt.Rectangle((-kp, -kp), 2 * kp, 2 * kp, fill=False, color="C1", lw=1.5,
-                           label=f"2kp x 2kp = {2 * kp} px  (circumscribing box)"))
-ax.add_patch(plt.Rectangle((-ko, -ko), 2 * ko, 2 * ko, fill=False, color="C2", lw=2,
-                           label=f"2ko x 2ko = {n_obj_lowres} px  (n_obj_lowres, R = {achieved_R:.2f})"))
-lim = 2 * kp
-ax.set_xlim(-lim, lim)
-ax.set_ylim(-lim, lim)
-ax.set_aspect("equal")
-ax.axhline(0, color="0.85", lw=0.5, zorder=0)
-ax.axvline(0, color="0.85", lw=0.5, zorder=0)
-ax.set_xlabel("kx [detector px]")
-ax.set_ylabel("ky [detector px]")
-ax.set_title("RPI band-limit geometry in reciprocal space")
-ax.legend(fontsize=8, loc="upper right")
-plt.tight_layout()
-fig.savefig(recon_dir / "bandlimit_init.png", dpi=120, bbox_inches="tight")
-plt.show()
-
-
 #%% ---------------------------------------------------------------- run
 
 probe_optimizable = rpi_probe_start is not None
@@ -432,6 +473,8 @@ for restart in range(rpi_num_restarts):
         + 1j * torch.randn(n_obj_lowres, n_obj_lowres, dtype=torch.float32, device=torch_device)
     if rpi_object_init == "random":                # the paper's init (its objects were random)
         obj_lowres = rpi_init_sigma * noise
+    elif rpi_object_init == "esw":                 # known-illumination ER estimate (see above)
+        obj_lowres = esw_seed + rpi_init_sigma * noise
     else:                                          # a transmission object sits near 1
         obj_lowres = torch.ones_like(noise) + rpi_init_sigma * noise
     obj_lowres = obj_lowres.to(get_default_complex_dtype()).requires_grad_(True)
@@ -497,13 +540,9 @@ for restart in range(rpi_num_restarts):
 obj_lowres = best_obj_lowres
 recon_probe = best_probe
 obj_fullres = fourier_upsample_object(obj_lowres, n_dp).detach()
-obj_lowres_np = obj_lowres.cpu().numpy()
 obj_fullres_np = obj_fullres.cpu().numpy()
 recon_probe_np = recon_probe.cpu().numpy()
 
-if best_loss < 0.7 * noise_floor:
-    print(f"  NOTE: final loss {best_loss:.5f} is well below the Poisson floor "
-          f"{noise_floor:.5f} -- the fit is absorbing shot noise. Lower rpi_resolution_ratio.")
 if probe_optimizable:
     dprobe = float((recon_probe - probe_ref).abs().sum() / probe_ref.abs().sum()) * 100
     print(f"  probe changed by {dprobe:.1f}% after release at iteration {rpi_probe_start}")
@@ -529,39 +568,36 @@ for ax in axes.ravel():
 plt.tight_layout()
 plt.show()
 
-# Diagnostics: the array actually optimized, and convergence against the noise floor.
-fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-axes[0].imshow(np.abs(obj_lowres_np), cmap="gray")
-axes[0].set_title(f"low-res object amplitude\n{n_obj_lowres}px, {object_pixel_size_m * 1e9:.0f} nm/px")
-axes[1].imshow(np.angle(obj_lowres_np), cmap="gray")
-axes[1].set_title("low-res object phase")
-for ax in axes[:2]:
-    ax.set_xticks([]), ax.set_yticks([])
-axes[2].semilogy(best_losses, label="diffraction loss")
-# axes[2].axhline(noise_floor, color="red", ls="--", lw=1, label=f"Poisson floor {noise_floor:.4f}")
+# Diagnostics: convergence against the noise floor.
+fig, ax = plt.subplots(figsize=(5, 4))
+ax.semilogy(best_losses, label="diffraction loss")
+# ax.axhline(noise_floor, color="red", ls="--", lw=1, label=f"Poisson floor {noise_floor:.4f}")
 if probe_optimizable:
-    axes[2].axvline(rpi_probe_start, color="0.5", ls=":", lw=1, label="probe released")
-axes[2].set_xlabel("iteration"), axes[2].set_ylabel("loss")
-axes[2].set_title(f"R = {achieved_R:.2f}, final {best_loss:.5f}")
-axes[2].legend(fontsize=7)
+    ax.axvline(rpi_probe_start, color="0.5", ls=":", lw=1, label="probe released")
+ax.set_xlabel("iteration"), ax.set_ylabel("loss")
+ax.set_title(f"final loss {best_loss:.5f}")
+ax.legend(fontsize=7)
 plt.tight_layout()
 plt.show()
 
 
 #%% ---------------------------------------------------------------- save
 
+extra_attrs = {
+    "wavelength_m": wavelength_m,
+    "detector_distance_m": det_dist_m,
+    "noise_floor": noise_floor,
+    "final_loss": best_loss,
+    "frame_index": frame_index,
+}
+if rpi_object_init == "esw":
+    extra_attrs["rpi_resolution_ratio"] = achieved_R
+    extra_attrs["probe_fourier_radius_px"] = kp
+
 save_rpi_reconstruction(
     obj_lowres, obj_fullres, recon_probe, best_losses, recon_dir,
     pixel_size_m=pixel_size_m, object_pixel_size_m=object_pixel_size_m,
     position_px=position_px[None, :], illumination=illumination.astype(np.float32),
-    extra_attrs={
-        "wavelength_m": wavelength_m,
-        "detector_distance_m": det_dist_m,
-        "rpi_resolution_ratio": achieved_R,
-        "probe_fourier_radius_px": kp,
-        "noise_floor": noise_floor,
-        "final_loss": best_loss,
-        "frame_index": frame_index,
-    },
+    extra_attrs=extra_attrs,
 )
 print(f"results in {recon_dir}")

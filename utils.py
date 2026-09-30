@@ -1416,10 +1416,12 @@ def make_rpi_recon_dir_name(cfg=None, suffix="", **knobs):
         frame62_RPI_Adam_Nobj88_R0.5_p10_opr1_pf
 
     frame<i>, algorithm tag "RPI", the optimizer class name, Nobj<n_obj_lowres>
-    (the band-limited object grid actually used), R<rpi_resolution_ratio> (the
-    configured target ratio), p<n_probe_modes>, opr<n_opr_modes>, and either
-    "pf" (probe held fixed throughout) or "prel<rpi_probe_start>" (released at
-    that epoch).
+    (the object grid actually used), R<rpi_resolution_ratio> (the configured
+    ratio, omitted when the caller doesn't define one),
+    relax<rpi_relaxation_freq>_<rpi_relax_start>-<rpi_relax_end> (only when
+    band-limit relaxation is enabled), p<n_probe_modes>, opr<n_opr_modes>,
+    and either "pf" (probe held fixed throughout) or "prel<rpi_probe_start>"
+    (released at that epoch).
 
     Same calling convention as `make_recon_dir_name`: knobs come from `cfg`,
     which defaults to the caller's globals, unless given as keywords, and a
@@ -1439,12 +1441,21 @@ def make_rpi_recon_dir_name(cfg=None, suffix="", **knobs):
         return knobs[name] if name in knobs else _lookup(cfg, name, default)
 
     probe_start = k("rpi_probe_start", None)
+    relax_freq = k("rpi_relaxation_freq", None)
+    resolution_ratio = k("rpi_resolution_ratio", None)
     parts = [
         f"frame{k('frame_index')}",
         "RPI",
         k("optimizer_name"),
         f"Nobj{k('n_obj_lowres')}",
-        f"R{k('rpi_resolution_ratio'):g}",
+    ]
+    if resolution_ratio is not None:
+        parts.append(f"R{resolution_ratio:g}")
+    if relax_freq:
+        relax_start = k("rpi_relax_start", 0)
+        relax_end = k("rpi_relax_end", k("num_epochs", ""))
+        parts.append(f"relax{relax_freq}_{relax_start}-{relax_end}")
+    parts += [
         f"p{k('n_probe_modes')}",
         f"opr{k('n_opr_modes', 1)}",
     ]
@@ -1540,8 +1551,11 @@ def collect_rpi_params(cfg=None, **overrides):
         "pixel_size_m": k("pixel_size_m"),
         "n_probe_modes": k("n_probe_modes"),
         "n_opr_modes": k("n_opr_modes", 1),
-        "rpi_resolution_ratio": k("rpi_resolution_ratio"),
-        "rpi_kp_quantile": k("rpi_kp_quantile"),
+        "rpi_resolution_ratio": k("rpi_resolution_ratio", None),
+        "rpi_kp_quantile": k("rpi_kp_quantile", None),
+        "rpi_relaxation_freq": k("rpi_relaxation_freq", None),
+        "rpi_relax_start": k("rpi_relax_start", None),
+        "rpi_relax_end": k("rpi_relax_end", None),
         "num_epochs": k("num_epochs"),
         "optimizer": k("rpi_optimizer_cls").__name__,
         "rpi_lr": k("rpi_lr"),
