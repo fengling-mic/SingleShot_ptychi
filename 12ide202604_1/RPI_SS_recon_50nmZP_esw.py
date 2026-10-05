@@ -104,7 +104,7 @@ probe_diameter_m = 3.5e-6        # only used when no probe comes from init_recon
 # rpi_object_init == "esw": the ESW/PRL estimate's real information is limited to what
 # the probe's numerical aperture can resolve, so in that mode the optimization itself is
 # also constrained to that resolution (see "RPI setup" below). Unused otherwise.
-rpi_resolution_ratio = 0.5
+rpi_resolution_ratio = 100
 rpi_kp_quantile = 0.95           # fraction of probe far-field power used to define kp
 
 # --- optimizer --------------------------------------------------------------
@@ -332,11 +332,13 @@ print(f"  Poisson noise floor of the loss ~ {noise_floor:.5f}")
 # Same function used to seed the multi-position reconstruction in
 # ptychi_reconstruction_siemensStar_esw.py, called here with this script's single
 # measured pattern only (n_pos=1) -- no other scan position's data enters the seed,
-# keeping the reconstruction genuinely single-shot. With one position the |P|^2-weighted
-# stitch degenerates to a single placement, so the returned canvas is n_dp x n_dp; it is
-# then cropped down to n_obj_lowres (fourier_resample, the inverse of
-# fourier_upsample_object's zero-padding) to match the band limit computed right below,
-# after this estimate exists, since this init mode is what that band limit exists for.
+# keeping the reconstruction genuinely single-shot. Its inputs (patterns, probe, mask)
+# are never resized -- it always solves at full n_dp, since that's the detector's own
+# native resolution. With one position the |P|^2-weighted stitch degenerates to a single
+# placement, so the returned OBJECT estimate is n_dp x n_dp; only that result (not
+# esw_object_prl itself) is cropped down to n_obj_lowres afterward (fourier_resample, the
+# inverse of fourier_upsample_object's zero-padding) to match the band limit computed
+# right below, before being used as obj_lowres's initial guess.
 def esw_object_prl(
     patterns, probe_2d, positions_px, object_shape, valid_pixel_mask,
     n_iterations=1000, batch_size=32, verbose=True,
