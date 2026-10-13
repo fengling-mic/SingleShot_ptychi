@@ -593,6 +593,122 @@ def _fresnel_propagate(field_np, distance_m, dx_m, wavelength_m, device="cpu"):
     return out.detach().cpu().numpy(), dx_out_m
 
 
+def _randomized_zoneplate_transmission(
+    pixel_size_m, wavelength_m, outer_zone_width_m, focal_spot_diameter_m,
+    zp_radius_m, central_stop, zp_transmission, oversample, seed, device,
+):
+    """Steps 1-3 of `make_randomized_zoneplate_probe`: the zone plate's own
+    transmission function, on its own plane.
+
+    1) random phase over a disk of radius Rmax = focal_spot_diameter_m / 2, at
+       the focus/object plane.
+    2) back-propagate (Fresnel) by -foc to the zone-plate plane. foc solves
+       the zone-plate equation foc = 2 * zp_radius_m * outer_zone_width_m /
+       wavelength_m; the destination pixel pitch comes back rescaled from
+       `_fresnel_propagate`, not forced to match pixel_size_m.
+    3) zone-plate transmission, on the zone-plate-plane's own grid: binarize
+       the SIGN of the field's own phase -- no geometric zone-boundary
+       formula. The backpropagated field is fully-developed speckle already
+       (a linear propagation of a random-phase source), with grain size
+       wavelength_m * foc / (2 * Rmax) (== outer_zone_width_m at the default
+       zp_radius_m), so this directly produces a binary random mask at that
+       feature size.
+
+       Do NOT thread the deterministic thin-lens chirp (pi * R^2 /
+       (wavelength_m * foc)) into this threshold instead -- tried first, and
+       since the backpropagated field is also the illumination in
+       `make_randomized_zoneplate_probe`, the trig cross-term between the
+       fixed chirp and the field's own phase leaves a coherent, undegraded
+       focusing wave riding on top of the speckle: an unphysical bright
+       central spike, confirmed by testing, that a real randomized zone plate
+       does not show.
+
+       A central stop (`central_stop` * zp_radius_m) and the outer edge both
+       get a soft tanh roll-off (`_soft_step`) rather than a hard cutoff.
+
+    Returns the zone-plate transmission (already including the central-stop/
+    outer-edge envelope), the field illuminating it (needed by the probe
+    simulation, which continues by propagating `field_zp * zone_plate`
+    forward), that plane's pixel pitch, and the derived geometry.
+    """
+    rng = np.random.default_rng(seed)
+    Rmax = focal_spot_diameter_m / 2.0
+    r_zp = Rmax if zp_radius_m is None else float(zp_radius_m)
+    bs_zp = central_stop * r_zp
+    foc = 2.0 * r_zp * outer_zone_width_m / wavelength_m
+
+    n_zp = int(np.ceil(2 * oversample * r_zp / pixel_size_m))
+    n_zp += n_zp % 2
+
+    Xf, Yf = _grid(n_zp, pixel_size_m)
+    support = np.hypot(Xf, Yf) <= Rmax
+    field = np.zeros((n_zp, n_zp), dtype=np.complex128)
+    field[support] = np.exp(2j * np.pi * rng.random(int(support.sum())))
+
+    field_zp, res_zp = _fresnel_propagate(field, -foc, pixel_size_m, wavelength_m, device)
+
+    Xz, Yz = _grid(n_zp, res_zp)
+    Rz = np.hypot(Xz, Yz)
+    transmission = np.where(np.angle(field_zp) > 0, zp_transmission, 1.0 + 0j)
+
+    edge = 4.0 * res_zp
+    envelope = _soft_step(Rz, r_zp, edge)
+    if central_stop > 0:
+        envelope = envelope * (1.0 - _soft_step(Rz, bs_zp, edge))
+
+    return transmission * envelope, field_zp, res_zp, foc, r_zp, bs_zp, n_zp, Rmax
+
+
+def make_randomized_zoneplate(
+    pixel_size_m,
+    wavelength_m,
+    outer_zone_width_m,
+    focal_spot_diameter_m,
+    zp_radius_m=None,
+    central_stop=0.15,
+    zp_transmission=-1.0 + 0j,
+    oversample=8,
+    seed=0,
+    device="cpu",
+    dtype=np.complex64,
+):
+    """The randomized zone plate itself: its transmission function, on its own plane.
+
+    This is the optic -- the binary random pattern a real randomized zone
+    plate would be fabricated to -- as opposed to
+    `make_randomized_zoneplate_probe`, which propagates light through it to
+    get the focused probe at the sample. Same construction (see
+    `_randomized_zoneplate_transmission`): a random-phase disk at the focus
+    plane is Fresnel back-propagated to the zone-plate plane, and the SIGN of
+    its own phase there is thresholded to give the zone boundaries -- so for
+    the same physical parameters and `seed`, this and
+    `make_randomized_zoneplate_probe` describe a consistent optic/probe pair
+    (the probe is exactly what comes from illuminating this pattern and
+    propagating `foc` forward).
+
+    Parameters are shared with `make_randomized_zoneplate_probe` (see there
+    for details) minus `size`/`power`/`verbose`, which only apply to the
+    probe. The zone-plate-plane grid size and pixel pitch are derived from
+    the inputs rather than given directly, so both are returned.
+
+    Returns
+    -------
+    zone_plate : numpy.ndarray
+        Complex transmission (including the central-stop/outer-edge
+        envelope), shape (n_zp, n_zp).
+    zp_pixel_size_m : float
+        Pixel pitch of `zone_plate` -- NOT `pixel_size_m` (that is the
+        sample/focus-plane pitch the construction starts from).
+    """
+    zone_plate, _field_zp, res_zp, _foc, _r_zp, _bs_zp, _n_zp, _Rmax = (
+        _randomized_zoneplate_transmission(
+            pixel_size_m, wavelength_m, outer_zone_width_m, focal_spot_diameter_m,
+            zp_radius_m, central_stop, zp_transmission, oversample, seed, device,
+        )
+    )
+    return zone_plate.astype(dtype), res_zp
+
+
 def make_randomized_zoneplate_probe(
     size,
     pixel_size_m,
@@ -723,47 +839,15 @@ def make_randomized_zoneplate_probe(
     numpy.ndarray
         Complex probe, shaped (1, 1, size, size) like `make_disk_probe`.
     """
-    rng = np.random.default_rng(seed)
-    Rmax = focal_spot_diameter_m / 2.0
-    r_zp = Rmax if zp_radius_m is None else float(zp_radius_m)
-    bs_zp = central_stop * r_zp
-    foc = 2.0 * r_zp * outer_zone_width_m / wavelength_m
-
-    n_zp = int(np.ceil(2 * oversample * r_zp / pixel_size_m))
-    n_zp += n_zp % 2
-
-    # 1) random phase over a disk of radius Rmax, at the focus/object plane
-    Xf, Yf = _grid(n_zp, pixel_size_m)
-    support = np.hypot(Xf, Yf) <= Rmax
-    field = np.zeros((n_zp, n_zp), dtype=np.complex128)
-    field[support] = np.exp(2j * np.pi * rng.random(int(support.sum())))
-
-    # 2) back-propagate to the zone-plate plane
-    field_zp, res_zp = _fresnel_propagate(field, -foc, pixel_size_m, wavelength_m, device)
-
-    # 3) zone-plate transmission, on the zone-plate-plane's own grid: binarize
-    # the SIGN of the field's own phase -- no geometric zone-boundary formula.
-    # field_zp is fully-developed speckle already (a linear propagation of a
-    # random-phase source), with grain size wavelength_m * foc / (2 * Rmax)
-    # (== outer_zone_width_m at the default zp_radius_m), so this directly
-    # produces a binary random mask at that feature size.
-    #
-    # Do NOT thread the deterministic thin-lens chirp (pi * R^2 /
-    # (wavelength_m * foc)) into this threshold instead -- tried first, and
-    # since field_zp is also the illumination here, the trig cross-term
-    # between the fixed chirp and the field's own phase leaves a coherent,
-    # undegraded focusing wave riding on top of the speckle: an unphysical
-    # bright central spike, confirmed by testing, that a real randomized zone
-    # plate does not show.
-    Xz, Yz = _grid(n_zp, res_zp)
-    Rz = np.hypot(Xz, Yz)
-    transmission = np.where(np.angle(field_zp) > 0, zp_transmission, 1.0 + 0j)
-
-    edge = 4.0 * res_zp
-    envelope = _soft_step(Rz, r_zp, edge)
-    if central_stop > 0:
-        envelope = envelope * (1.0 - _soft_step(Rz, bs_zp, edge))
-    field_after_zp = field_zp * transmission * envelope
+    # 1-3) the zone plate's own transmission function (see
+    # `_randomized_zoneplate_transmission`) and the field illuminating it.
+    zone_plate, field_zp, res_zp, foc, r_zp, bs_zp, n_zp, Rmax = (
+        _randomized_zoneplate_transmission(
+            pixel_size_m, wavelength_m, outer_zone_width_m, focal_spot_diameter_m,
+            zp_radius_m, central_stop, zp_transmission, oversample, seed, device,
+        )
+    )
+    field_after_zp = field_zp * zone_plate
 
     # 4) forward-propagate back to the focus/object plane
     probe_full, res_out = _fresnel_propagate(field_after_zp, foc, res_zp, wavelength_m, device)
@@ -1064,6 +1148,392 @@ def rpi_diffraction_loss(predicted_intensity, measured_intensity, mask):
     """Normalized amplitude MSE (Eq. 2), over valid detector pixels only."""
     resid = (predicted_intensity.sqrt() - measured_intensity.sqrt()) ** 2
     return (resid * mask).sum() / (measured_intensity * mask).sum()
+
+
+# ---------------------------------------------------------------------------
+# Comparing reconstructions: pty-chi's position convention, phase-ramp removal,
+# and Fourier Ring Correlation (FRC) between two object reconstructions.
+# ---------------------------------------------------------------------------
+
+
+def object_position_origin(shape):
+    """Pixel index (row0, col0) that scan position (0, 0) maps to in an object
+    array of `shape`.
+
+    pty-chi's default `ObjectPosOriginCoordsMethods.SUPPORT` (set explicitly by
+    every reconstruction script in this repo) centers position (0, 0) on the
+    object buffer: `round(shape / 2) - 0.5`, with `round` banker's-rounding
+    (round half to even, like `np.round`/`torch.round`) -- NOT the naive
+    `(shape - 1) / 2`, which is off by 1 px whenever a lateral dimension is
+    === 3 mod 4. Uses `shape[-2:]`.
+    """
+    hw = np.asarray(shape[-2:], dtype=np.float64)
+    row0, col0 = np.round(hw / 2.0) - 0.5
+    return float(row0), float(col0)
+
+
+def object_pixel_from_position(position_rc, shape, pos_origin=None):
+    """Continuous (row, col) pixel index in an object of `shape` for scan
+    position `position_rc` (pty-chi's (y, x) convention), via
+    `object_position_origin`."""
+    if pos_origin is None:
+        pos_origin = object_position_origin(shape)
+    return pos_origin[0] + position_rc[0], pos_origin[1] + position_rc[1]
+
+
+def scan_bbox_slice(shape, positions_px, erode_px=0.0):
+    """(row_slice, col_slice) bounding box of the scan positions, in `shape`'s
+    array indices -- the interior fully covered by every part of the probe, as
+    opposed to the unconstrained padding pty-chi leaves around it. Same
+    convention as `4idd_202603/remove_object_phase_ramp.py`'s `scan_bbox_mask`,
+    but anchored with the (corrected) `object_position_origin`.
+    """
+    row0, col0 = object_position_origin(shape)
+    y0 = row0 + positions_px[:, 0].min() + erode_px
+    y1 = row0 + positions_px[:, 0].max() - erode_px
+    x0 = col0 + positions_px[:, 1].min() + erode_px
+    x1 = col0 + positions_px[:, 1].max() - erode_px
+    ys = slice(max(int(np.ceil(y0)), 0), min(int(np.floor(y1)) + 1, shape[-2]))
+    xs = slice(max(int(np.ceil(x0)), 0), min(int(np.floor(x1)) + 1, shape[-1]))
+    if ys.stop <= ys.start or xs.stop <= xs.start:
+        raise ValueError("scan bounding box is empty after erosion")
+    return ys, xs
+
+
+def crop_at_position(obj, position_rc, out_shape, pos_origin=None):
+    """Crop `out_shape` out of `obj`'s last two axes, centered on scan position
+    `position_rc` (via `object_pixel_from_position`). Zero-pads if the window
+    would run off the array.
+
+    Returns `(crop, center_rc)`, where `center_rc` is the (rounded-to-pixel)
+    center actually used -- compare it against a cross-correlation refinement
+    as a sanity check on the position convention.
+    """
+    h, w = out_shape
+    cy, cx = object_pixel_from_position(position_rc, obj.shape[-2:], pos_origin)
+    cy, cx = int(round(cy)), int(round(cx))
+    y0, x0 = cy - h // 2, cx - w // 2
+
+    out = np.zeros(obj.shape[:-2] + (h, w), dtype=obj.dtype)
+    sy0, sy1 = max(y0, 0), min(y0 + h, obj.shape[-2])
+    sx0, sx1 = max(x0, 0), min(x0 + w, obj.shape[-1])
+    dy0, dx0 = sy0 - y0, sx0 - x0
+    out[..., dy0 : dy0 + (sy1 - sy0), dx0 : dx0 + (sx1 - sx0)] = obj[..., sy0:sy1, sx0:sx1]
+    return out, (cy, cx)
+
+
+def remove_phase_ramp(obj, refine=True):
+    """Divide the linear phase ramp and constant offset out of a complex object.
+
+    A ptychographic solution is only defined up to O(r) -> O(r) * exp(i(k.r+c))
+    (the opposite ramp on the probe cancels it in the data), so independent
+    reconstructions are not directly comparable until this gauge is fixed --
+    left in, it dominates/corrupts a phase-image FRC. Same estimator as
+    `4idd_202603/remove_object_phase_ramp.py` (`--method fourier`, its
+    default): the FFT peak of `obj` gives the ramp to one bin, then Nelder-Mead
+    refines it by maximizing the magnitude of the coherent sum
+    sum(obj * exp(-i k.r)) -- robust and subpixel, with no phase unwrapping.
+
+    Fit over `obj` as given, so crop to the region with real signal (e.g.
+    `scan_bbox_slice`, or a `crop_at_position` result) before calling this --
+    an unconstrained padded border biases the fit.
+
+    Returns `(corrected, ramp_cycles_per_px, offset_rad)`.
+    """
+    from scipy.optimize import minimize
+
+    h, w = obj.shape[-2:]
+    y = np.arange(h) - (h - 1) / 2.0
+    x = np.arange(w) - (w - 1) / 2.0
+
+    spec = np.fft.fft2(obj)
+    iy, ix = np.unravel_index(np.argmax(np.abs(spec)), spec.shape)
+    f = np.array([np.fft.fftfreq(h)[iy], np.fft.fftfreq(w)[ix]])
+
+    if refine:
+        scale = 1.0 / max(np.abs(obj).sum(), 1e-30)
+
+        def neg_coherent_sum(fr):
+            ey = np.exp(-2j * np.pi * fr[0] * y)
+            ex = np.exp(-2j * np.pi * fr[1] * x)
+            return -np.abs(ey @ (obj @ ex)) * scale
+
+        res = minimize(
+            neg_coherent_sum, f, method="Nelder-Mead",
+            options={"xatol": 1e-4 * min(1.0 / h, 1.0 / w), "fatol": 1e-12, "maxiter": 2000},
+        )
+        f = np.asarray(res.x)
+
+    ramp = 2 * np.pi * (f[0] * y[:, None] + f[1] * x[None, :])
+    corrected = obj * np.exp(-1j * ramp)
+    offset = float(np.angle(np.sum(corrected)))
+    corrected = corrected * np.exp(-1j * offset)
+    return corrected, f, offset
+
+
+def align_pair(img_a, img_b, upsample_factor=20):
+    """Cross-correlate on amplitude and Fourier-shift `img_b` onto `img_a`'s grid.
+
+    Independent reconstructions (even of the identical data) are never pixel-perfect
+    aligned, so this is the registration step every pairwise comparison -- FRC included --
+    needs first. Returns `(img_a, aligned_b, shift_rc)`.
+
+    (skimage's `error` return value is dropped -- under the default
+    `normalization="phase"` it mixes a phase-normalized correlation peak with an
+    amplitude-based error formula and saturates near 1.0 regardless of fit quality; not
+    meaningful here.)
+    """
+    from scipy.ndimage import fourier_shift
+    from skimage.registration import phase_cross_correlation
+
+    shift, _error, _ = phase_cross_correlation(np.abs(img_a), np.abs(img_b),
+                                               upsample_factor=upsample_factor)
+    aligned_b = np.fft.ifft2(fourier_shift(np.fft.fft2(img_b), shift))
+    return img_a, aligned_b, shift
+
+
+def fourier_ring_correlation(img1, img2, pixel_size_m=1.0, window="tukey", window_alpha=0.25):
+    """Fourier Ring Correlation between two same-shape real-valued 2D images.
+
+    Both images are apodized (a 2D Tukey window by default -- `window=None` to
+    skip) before the FFT: an object-phase crop is not periodic, and the hard
+    edge would otherwise leak into every ring as spurious high-frequency
+    "signal". FRC(r) is the normalized cross-correlation of the two spectra,
+    averaged over pixels at integer radius r:
+
+        FRC(r) = Re(sum_r F1 F2*) / sqrt(sum_r |F1|^2 * sum_r |F2|^2)
+
+    Returns `(freq_per_m, frc, n_per_ring)`: spatial frequency (cycles per
+    metre, via `pixel_size_m`), the FRC curve, and the number of Fourier pixels
+    averaged into each ring (needed by `frc_half_bit_threshold`).
+    """
+    assert img1.shape == img2.shape, "images must be the same shape for FRC"
+    h, w = img1.shape[-2:]
+    if window:
+        from scipy.signal.windows import tukey
+
+        win = tukey(h, window_alpha)[:, None] * tukey(w, window_alpha)[None, :]
+        img1 = img1 * win
+        img2 = img2 * win
+
+    F1 = np.fft.fftshift(np.fft.fft2(img1))
+    F2 = np.fft.fftshift(np.fft.fft2(img2))
+
+    yy, xx = np.mgrid[:h, :w]
+    r = np.round(np.hypot(yy - h // 2, xx - w // 2)).astype(int)
+    r_max = min(h, w) // 2
+
+    cross = np.bincount(r.ravel(), weights=np.real(F1 * np.conj(F2)).ravel(), minlength=r_max + 1)
+    p1 = np.bincount(r.ravel(), weights=(np.abs(F1) ** 2).ravel(), minlength=r_max + 1)
+    p2 = np.bincount(r.ravel(), weights=(np.abs(F2) ** 2).ravel(), minlength=r_max + 1)
+    n_per_ring = np.bincount(r.ravel(), minlength=r_max + 1).astype(np.float64)
+    cross, p1, p2, n_per_ring = (a[: r_max + 1] for a in (cross, p1, p2, n_per_ring))
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        frc = cross / np.sqrt(p1 * p2)
+    freq_per_m = (np.arange(r_max + 1) / (min(h, w) * pixel_size_m))
+    return freq_per_m, frc, n_per_ring
+
+
+def phase_frc(obj_a, obj_b, pixel_size_m, align=True, upsample_factor=20, **frc_kwargs):
+    """FRC between the PHASES of two complex objects -- the actual check this is all
+    for, once each object has been cropped to a common area and deramped
+    (`remove_phase_ramp`): register them (`align_pair`) and run
+    `fourier_ring_correlation` on `angle(obj_a)` vs `angle(obj_b)`.
+
+    `align=False` skips registration, for inputs the caller already knows share a
+    coordinate frame. Extra keywords (e.g. `window`) pass through to
+    `fourier_ring_correlation`.
+
+    Returns `(freq_per_m, frc, n_per_ring, shift_rc)` -- the usual
+    `fourier_ring_correlation` triple plus the registration shift found (zeros if
+    `align=False`), so the caller can log/sanity-check it.
+    """
+    shift = np.zeros(2)
+    if align:
+        obj_a, obj_b, shift = align_pair(obj_a, obj_b, upsample_factor=upsample_factor)
+    freq_per_m, frc, n_per_ring = fourier_ring_correlation(
+        np.angle(obj_a), np.angle(obj_b), pixel_size_m, **frc_kwargs
+    )
+    return freq_per_m, frc, n_per_ring, shift
+
+
+def frc_half_bit_threshold(n_per_ring):
+    """Van Heel & Schatz (2005) "half-bit" FRC threshold curve, as a function of
+    the number of independent Fourier samples per ring (`n_per_ring`, from
+    `fourier_ring_correlation`).
+
+    The standard resolution criterion for the FRC between two independently
+    reconstructed images of the same object (the same curve used for 2D FRC in
+    super-resolution microscopy, e.g. Nieuwenhuizen et al. 2013, Nat. Methods);
+    where the measured FRC crosses this curve is read off as the resolution.
+    (Constants per the standard, widely-reproduced formula -- double check
+    against the original paper if the exact number will be published.)
+    """
+    n = np.maximum(np.asarray(n_per_ring, dtype=np.float64), 1.0)
+    inv_sqrt_n = 1.0 / np.sqrt(n)
+    return (0.2071 + 1.9102 * inv_sqrt_n) / (1.2071 + 0.9102 * inv_sqrt_n)
+
+
+def _frc_crossing(freq, curve, threshold):
+    """First frequency where `curve` drops from above to below `threshold`
+    (scalar or per-frequency array), linearly interpolated. None if it never
+    crosses."""
+    thr = np.full_like(curve, threshold, dtype=np.float64) if np.isscalar(threshold) \
+        else np.asarray(threshold, dtype=np.float64)
+    diff = np.asarray(curve, dtype=np.float64) - thr
+    hits = np.flatnonzero((diff[:-1] >= 0) & (diff[1:] < 0))
+    if hits.size == 0:
+        return None
+    i = hits[0]
+    t = diff[i] / (diff[i] - diff[i + 1])
+    return freq[i] + t * (freq[i + 1] - freq[i])
+
+
+def plot_frc(freq_per_m, curves, threshold=None, labels=None, title=None, ax=None):
+    """Plot one or more FRC curves vs. spatial frequency, with resolution (nm)
+    on a twin top axis, and a threshold curve if given (e.g. from
+    `frc_half_bit_threshold`). `curves` is a single 1D array or a sequence of
+    them; prints and marks the threshold-crossing resolution for each.
+    """
+    if isinstance(curves, np.ndarray) and curves.ndim == 1:
+        curves = [curves]
+    if labels is None:
+        labels = [f"curve {i}" for i in range(len(curves))]
+
+    freq_per_um = freq_per_m * 1e-6
+    fig = None
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4.5))
+    for curve, label in zip(curves, labels):
+        line, = ax.plot(freq_per_um, curve, label=label)
+        if threshold is not None:
+            crossing = _frc_crossing(freq_per_m, curve, threshold)
+            if crossing is not None and crossing > 0:
+                res_nm = 1.0 / crossing * 1e9
+                ax.axvline(crossing * 1e-6, color=line.get_color(), ls=":", lw=1.5, alpha=0.9)
+                print(f"  {label}: FRC crosses threshold at {crossing * 1e-6:.4f} 1/um "
+                      f"-> resolution {res_nm:.1f} nm")
+            else:
+                print(f"  {label}: FRC never drops below threshold within the Nyquist range")
+    if threshold is not None:
+        thr_curve = threshold if not np.isscalar(threshold) else np.full_like(freq_per_um, threshold)
+        ax.plot(freq_per_um, thr_curve, "k--", lw=1, label="half-bit threshold")
+
+    ax.set_xlabel("spatial frequency [1/um]")
+    ax.set_ylabel("FRC")
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlim(0, freq_per_um[-1])
+    ax.axhline(0, color="0.8", lw=0.5, zorder=0)
+    ax.legend(fontsize=8)
+    if title:
+        ax.set_title(title)
+
+    def _um_to_nm(f_per_um):
+        # Self-inverse (1/x) transform for the twin axis. matplotlib evaluates this at
+        # the primary axis's own limits (including 0) to set the secondary axis's range,
+        # and raises on inf/nan -- so clamp instead of dividing by exactly 0.
+        f_per_um = np.asarray(f_per_um, dtype=np.float64)
+        safe = np.where(f_per_um > 1e-9, f_per_um, 1e-9)
+        return 1e3 / safe
+
+    secax = ax.secondary_xaxis("top", functions=(_um_to_nm, _um_to_nm))
+    # The 1/f transform blows up near f=0, which left to auto-ticking pulls in a
+    # ridiculous (1e11 nm) tick and its scientific-notation offset box. Curate the
+    # ticks instead, to round nm values that actually fall within the plotted range.
+    #
+    # Tick POSITIONS for a `functions=`-based secondary axis are in the secondary
+    # (child, here nm) units, not the parent's -- matplotlib applies the *inverse*
+    # function to place them back on the shared frequency axis. Passing frequency
+    # values here (an earlier version of this code did) silently drops every tick:
+    # they get placed via the forward function instead, which only by coincidence
+    # ever landed inside the visible range.
+    freq_max_um = freq_per_um[-1] if freq_per_um[-1] > 0 else 1.0
+    candidate_nm = np.array([2000, 1000, 500, 300, 200, 150, 100, 70, 50, 40,
+                             30, 25, 20, 15, 12, 10, 8, 6, 5, 4])
+    tick_freq_um = 1e3 / candidate_nm
+    in_range = (tick_freq_um >= 0.02 * freq_max_um) & (tick_freq_um <= freq_max_um)
+    # candidate_nm is in descending-nm (ascending-frequency) order; thin out any
+    # candidate whose frequency position would crowd/overlap the previous kept one.
+    kept_nm, last_freq_um = [], -np.inf
+    for nm, f in zip(candidate_nm[in_range], tick_freq_um[in_range]):
+        if f - last_freq_um >= 0.07 * freq_max_um:
+            kept_nm.append(nm)
+            last_freq_um = f
+    secax.set_xticks(kept_nm)
+    secax.set_xticklabels([f"{v:g}" for v in kept_nm])
+    secax.set_xlabel("resolution [nm]")
+    if fig is not None:
+        plt.tight_layout()
+    return ax
+
+
+def frc_crossing_px(freq_per_m, curve, threshold, shape, pixel_size_m):
+    """`_frc_crossing`'s resolution-cutoff frequency, converted to a pixel radius in the
+    FFT of an image of `shape` at `pixel_size_m` -- for overlaying as a circle on a 2D
+    power spectrum (`plot_frc_rings`). Inverts `fourier_ring_correlation`'s own
+    `freq_per_m = arange(r_max+1) / (min(h,w)*pixel_size_m)`. `None` if the curve never
+    crosses (same as `_frc_crossing`).
+    """
+    crossing = _frc_crossing(freq_per_m, curve, threshold)
+    if crossing is None:
+        return None
+    return crossing * min(shape[-2:]) * pixel_size_m
+
+
+def plot_frc_rings(background_img, radii_px, labels=None, colors=None, title=None,
+                   window="tukey", window_alpha=0.25, log_floor=1e-3, ax=None):
+    """2D companion to `plot_frc`: `background_img`'s log-scale Fourier power spectrum,
+    with a circle at each entry of `radii_px` -- where each FRC curve's resolution cutoff
+    (from `frc_crossing_px`) actually sits in frequency space. Same visual style as the
+    "RPI band-limit geometry" plots (e.g.
+    `12ide202604_1/RPI_SS_recon_50nmZP_blrelax.py`): `imshow` + `plt.Circle` patches +
+    one legend.
+
+    `background_img` is Tukey-windowed first (unless `window=None`), matching
+    `fourier_ring_correlation`'s own windowing -- this is the spectrum the correlation
+    actually saw. Entries of `radii_px` that are `None` (a curve that never crossed the
+    threshold) are skipped.
+    """
+    h, w = background_img.shape[-2:]
+    img = background_img
+    if window:
+        from scipy.signal.windows import tukey
+
+        win = tukey(h, window_alpha)[:, None] * tukey(w, window_alpha)[None, :]
+        img = img * win
+
+    far = np.abs(np.fft.fftshift(np.fft.fft2(img))) ** 2
+    far_n = np.maximum(far / max(far.max(), 1e-300), log_floor)
+
+    if labels is None:
+        labels = [f"curve {i}" for i in range(len(radii_px))]
+    if colors is None:
+        colors = [f"C{i}" for i in range(len(radii_px))]
+
+    if ax is None:
+        _fig, ax = plt.subplots(figsize=(5.5, 5))
+    half_h, half_w = h / 2, w / 2
+    im = ax.imshow(np.log10(far_n), cmap="gray", origin="lower",
+                   vmin=np.log10(log_floor), vmax=0,
+                   extent=[-half_w, half_w, -half_h, half_h])
+    ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log10(power / max)")
+
+    for r_px, label, color in zip(radii_px, labels, colors):
+        if r_px is None:
+            continue
+        ax.add_patch(plt.Circle((0, 0), r_px, fill=False, color=color, lw=1.5,
+                                label=f"{label}: {r_px:.1f} px"))
+
+    ax.set_aspect("equal")
+    ax.axhline(0, color="0.85", lw=0.5, zorder=0)
+    ax.axvline(0, color="0.85", lw=0.5, zorder=0)
+    ax.set_xlabel("kx [px]")
+    ax.set_ylabel("ky [px]")
+    if title:
+        ax.set_title(title)
+    ax.legend(fontsize=8, loc="upper right")
+    return ax
 
 
 def _dp_frame(patterns, i, log, transpose):

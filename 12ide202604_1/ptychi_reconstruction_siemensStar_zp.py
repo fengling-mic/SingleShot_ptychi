@@ -176,7 +176,7 @@ if init_recon_file is not None:
     with h5py.File(init_recon_file, "r") as f:
         print(f"keys in {init_recon_file.name}: {list(f.keys())}")
         # prior["object"] = np.asarray(f["object"][()]).view(np.complex64)
-        # prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
+        prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
         prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
 
 if "positions_px" in prior:

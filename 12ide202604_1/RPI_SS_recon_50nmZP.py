@@ -41,6 +41,7 @@ from ptychi.utils import (
 from utils import (
     center_crop_or_pad,
     collect_rpi_params,
+    crop_at_position,
     fourier_resample,
     fourier_upsample_object,
     make_disk_probe,
@@ -188,6 +189,7 @@ prior = {}
 if init_recon_file is not None:
     with h5py.File(init_recon_file, "r") as f:
         print(f"keys in {init_recon_file.name}: {list(f.keys())}")
+        prior["object"] = np.asarray(f["object"][()]).view(np.complex64)
         prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
         prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
 
@@ -375,6 +377,7 @@ probe_far = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, 
     .sum(0).cpu().numpy()
 obj_far = np.abs(np.fft.fftshift(np.fft.fft2(obj_lowres_init_np))) ** 2
 
+#%%
 # Independent floors (in normalized-intensity units, i.e. decades below the peak): the
 # object's initial spectrum is nearly all DC + a flat noise floor (no real structure yet),
 # so it needs a much shallower floor than the probe to show that floor as texture instead
@@ -414,7 +417,88 @@ ax.set_ylabel("ky [detector px]")
 ax.set_title("RPI band-limit geometry in reciprocal space")
 ax.legend(fontsize=8, loc="upper right")
 plt.tight_layout()
-fig.savefig(recon_dir / "bandlimit_init.png", dpi=120, bbox_inches="tight")
+# fig.savefig(recon_dir / "bandlimit_init.png", dpi=120, bbox_inches="tight")
+plt.show()
+
+#%% define the oversampling factor for the imaging plane,
+# oversampling_ratio = wavelength * sample2detector_distance / (detector_pixel_size * probe_FoV)
+#                     = (n_dp * pixel_size_m) / probe_FoV   [since pixel_size_m = wavelength*dist/(n_dp*det_pixel_m)]
+# i.e. the classical CDI oversampling ratio: (real-space FOV the detector sampling implies)
+# / (the probe's actual illuminated footprint), using the already-computed illuminated-FOV
+# threshold crossing (rpi_illumination_threshold) as probe_FoV. Collapses the (possibly
+# slightly non-circular) row/col illuminated extents to one scalar via their average --
+# swap for max(...) below if you want the more conservative (smaller) number instead.
+diff_intensity = (measured * mask).cpu().numpy()
+
+# Reconstructed/simulated diffraction pattern: forward-model prediction E~ = F{P.O} using the
+# best available object -- the prior ptychography reconstruction, cropped to this frame's scan
+# position via crop_at_position, when available; otherwise the RPI object's own (near-unity,
+# not-yet-optimized) initial guess. Comparing this against the measured pattern (same color
+# scale) is a sanity check on the probe calibration and position before running RPI at all.
+if "object" in prior:
+    obj_patch_np, obj_patch_center = crop_at_position(
+        prior["object"].squeeze(0), position_px, (n_dp, n_dp)
+    )
+    obj_patch = torch.as_tensor(obj_patch_np, dtype=get_default_complex_dtype(), device=torch_device)
+else:
+    with torch.no_grad():
+        obj_patch = fourier_upsample_object(obj_lowres, n_dp)
+with torch.no_grad():
+    reconstructed_diff = simulate_rpi_diffraction(
+        obj_patch, probe_modes, n_dp, rpi_background_counts
+    ).cpu().numpy()
+
+probe_fov_px = 0.5 * ((ill_rows[-1] - ill_rows[0] + 1) + (ill_cols[-1] - ill_cols[0] + 1))
+probe_fov_m = probe_fov_px * pixel_size_m
+oversampling_ratio = wavelength_m * det_dist_m / (det_pixel_m * probe_fov_m)
+print(f"  probe FoV (> {rpi_illumination_threshold:g} of peak): {probe_fov_px:.1f} px "
+      f"= {probe_fov_m * 1e6:.2f} um")
+print(f"  oversampling ratio = wavelength*dist/(det_pixel*probe_FoV) = {oversampling_ratio:.3f} "
+      f"(classical finite-support CDI wants >= ~2)")
+
+# Plot the measured diffraction pattern, the reconstructed/simulated one, and the probe
+# illumination side by side, in each plane's own physical units (detector-plane mm, sample-plane
+# um), with a box marking the illuminated region (probe_fov_px) used as the denominator above.
+# measured and reconstructed share one color scale (normalized to the MEASURED peak) so any
+# intensity mismatch between them -- not just shape -- is visible.
+diff_floor = 1e-4
+diff_peak = diff_intensity.max()
+diff_norm = np.maximum(diff_intensity / diff_peak, diff_floor)
+recon_norm = np.maximum(reconstructed_diff / diff_peak, diff_floor)
+
+diff_extent_mm = n_dp / 2 * det_pixel_m * 1e3
+ill_extent_um = n_dp / 2 * pixel_size_m * 1e6
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+im0 = axes[0].imshow(np.log10(diff_norm), cmap="inferno", origin="lower",
+                     vmin=np.log10(diff_floor), vmax=0,
+                     extent=[-diff_extent_mm, diff_extent_mm, -diff_extent_mm, diff_extent_mm])
+fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label="log10(I / I_max,measured)")
+axes[0].set_xlabel("mm"), axes[0].set_ylabel("mm")
+axes[0].set_title("measured diffraction pattern")
+
+im_recon = axes[1].imshow(np.log10(recon_norm), cmap="inferno", origin="lower",
+                          vmin=np.log10(diff_floor), vmax=0,
+                          extent=[-diff_extent_mm, diff_extent_mm, -diff_extent_mm, diff_extent_mm])
+fig.colorbar(im_recon, ax=axes[1], fraction=0.046, pad=0.04, label="log10(I / I_max,measured)")
+axes[1].set_xlabel("mm"), axes[1].set_ylabel("mm")
+axes[1].set_title("reconstructed diffraction pattern\n(F{P.O}, O = prior ptychography object)")
+
+im2 = axes[2].imshow(illumination, cmap="inferno", origin="lower", vmin=0, vmax=1,
+                     extent=[-ill_extent_um, ill_extent_um, -ill_extent_um, ill_extent_um])
+x0 = (ill_cols[0] - n_dp / 2) * pixel_size_m * 1e6
+y0 = (ill_rows[0] - n_dp / 2) * pixel_size_m * 1e6
+width = (ill_cols[-1] - ill_cols[0] + 1) * pixel_size_m * 1e6
+height = (ill_rows[-1] - ill_rows[0] + 1) * pixel_size_m * 1e6
+axes[2].add_patch(plt.Rectangle((x0, y0), width, height, fill=False, color="tab:cyan", lw=1.5,
+                                label=f"probe FoV = {probe_fov_m * 1e6:.2f} um"))
+axes[2].legend(fontsize=8, loc="upper right")
+fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label="I / I_max")
+axes[2].set_xlabel("um"), axes[2].set_ylabel("um")
+axes[2].set_title("probe illumination |P|^2")
+
+fig.suptitle(f"oversampling ratio = {oversampling_ratio:.3f}")
+plt.tight_layout()
 plt.show()
 
 
