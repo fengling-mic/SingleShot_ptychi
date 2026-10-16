@@ -914,6 +914,278 @@ def make_randomized_zoneplate_probe(
     return probe[None, None]
 
 
+def _zoneplate_transmission(
+    pixel_size_m, wavelength_m, outer_zone_width_m, focal_spot_diameter_m,
+    zp_radius_m, central_stop, zp_transmission, oversample,
+):
+    """Deterministic counterpart to `_randomized_zoneplate_transmission`: the
+    classic concentric-ring Fresnel zone plate, on its own plane.
+
+    A real (unrandomized) zone plate's zone boundaries are a closed-form
+    function of radius, not a threshold on some backpropagated field's own
+    phase -- that trick is specific to the randomized construction, where the
+    "zone plate" and the illumination are deliberately the same speckle field
+    (see the warning in `_randomized_zoneplate_transmission`). Applying it to
+    a plane wave instead would just inherit the finite aperture's own Fresnel-
+    diffraction ripple as spurious zone-boundary jitter -- not a clean regular
+    zone plate. So this builds the transmission directly from the textbook
+    zone-radius relation instead:
+
+        zone n spans r^2 in [n, n+1) * wavelength_m * foc, alternating
+        transmission 1+0j (zone 0, the central disk, counts as open) and
+        `zp_transmission` -- the paraxial/thin-zone-plate approximation,
+        exact to O(n * wavelength_m / foc) ~ 1e-6 at typical x-ray zone-plate
+        parameters (far below fabrication tolerance).
+
+    foc solves the same zone-plate equation as the randomized construction:
+    foc = 2 * zp_radius_m * outer_zone_width_m / wavelength_m.
+
+    Choosing the zone-plate-plane grid (n_zp points at pitch dx_zp) is the
+    other half of the problem. `make_regular_zoneplate_probe` needs the
+    *single* forward Fresnel transform by `foc` to land exactly on a
+    `pixel_size_m`-pitch grid -- there is no backpropagate-then-forward-
+    propagate round trip to fall back on here, since there is nothing
+    upstream of the zone plate to backpropagate from (the plate's pattern is
+    already known in closed form, not derived from a field). The single-FFT
+    transform's own conjugate-grid relation fixes the *physical span* of the
+    zone-plate-plane grid independent of how many pixels sample it:
+
+        span = n_zp * dx_zp = wavelength_m * foc / pixel_size_m
+
+    (the same "pupil_span" relation `make_probe`'s plane="pupil" branch
+    uses). That span must already contain the full aperture, 2 * zp_radius_m
+    -- which, substituting `foc` above, reduces to
+
+        outer_zone_width_m >= pixel_size_m
+
+    independent of n_zp entirely: a finer grid cannot buy back coverage,
+    because dx_zp shrinks exactly as fast as n_zp grows once dx_zp is SOLVED
+    FOR (not chosen) from the span relation below. So n_zp is picked first,
+    from the resolution requirement alone (>= `oversample` pixels per
+    outermost zone), and dx_zp follows:
+
+        n_zp = ceil(oversample * wavelength_m * foc / (outer_zone_width_m * pixel_size_m))
+        dx_zp = wavelength_m * foc / (n_zp * pixel_size_m)
+
+    which makes the round-trip pixel size come back as exactly pixel_size_m
+    (checked numerically to 1 part in 1e15) regardless of how n_zp got
+    rounded, given outer_zone_width_m >= pixel_size_m (checked below; raises
+    otherwise -- there is no fallback). For the on-site parameters this
+    file's other docstrings already validate against (12-ID-C S0019, 8 keV,
+    8.8 nm sample-plane pixels, 50 nm outer zone, 3.5 um footprint) this
+    lands on n_zp=3182 at dx_zp=6.25 nm/px -- the IDENTICAL grid
+    `_randomized_zoneplate_transmission` derives for the same inputs. Not a
+    coincidence: both are the same single-FFT Fresnel transform's conjugate-
+    grid relation, just arrived at from opposite ends (there, from the focus
+    plane via a round trip; here, from the span-must-fit-the-aperture
+    argument above) -- so this costs no more memory or runtime than the
+    already-shipped randomized construction at the same parameters.
+
+    A central stop (`central_stop` * zp_radius_m) and the outer edge both get
+    a soft tanh roll-off (`_soft_step`), matching the randomized construction.
+
+    Returns the zone-plate transmission (already including the central-stop/
+    outer-edge envelope), a uniform (amplitude 1, phase 0) plane wave of the
+    same shape standing in for "the field illuminating it" so the caller can
+    multiply the two exactly like `make_randomized_zoneplate_probe` does,
+    that plane's pixel pitch, and the derived geometry.
+    """
+    Rmax = focal_spot_diameter_m / 2.0
+    r_zp = Rmax if zp_radius_m is None else float(zp_radius_m)
+    bs_zp = central_stop * r_zp
+    foc = 2.0 * r_zp * outer_zone_width_m / wavelength_m
+
+    if outer_zone_width_m < pixel_size_m:
+        raise ValueError(
+            f"outer_zone_width_m ({outer_zone_width_m * 1e9:.1f} nm) must be >= "
+            f"pixel_size_m ({pixel_size_m * 1e9:.2f} nm): the zone-plate-plane "
+            f"grid span that lands back on pixel_size_m after propagating "
+            f"forward by the focal length would be narrower than the zone "
+            f"plate's own aperture, however finely it is sampled."
+        )
+
+    n_zp = int(np.ceil(oversample * wavelength_m * foc / (outer_zone_width_m * pixel_size_m)))
+    n_zp += n_zp % 2
+    dx_zp = wavelength_m * foc / (n_zp * pixel_size_m)
+
+    Xz, Yz = _grid(n_zp, dx_zp)
+    Rz2 = Xz**2 + Yz**2
+    Rz = np.sqrt(Rz2)
+    zone_index = np.floor(Rz2 / (wavelength_m * foc)).astype(np.int64)
+    transmission = np.where(zone_index % 2 == 0, 1.0 + 0j, zp_transmission)
+
+    edge = 4.0 * dx_zp
+    envelope = _soft_step(Rz, r_zp, edge)
+    if central_stop > 0:
+        envelope = envelope * (1.0 - _soft_step(Rz, bs_zp, edge))
+
+    field_zp = np.ones((n_zp, n_zp), dtype=np.complex128)
+    return transmission * envelope, field_zp, dx_zp, foc, r_zp, bs_zp, n_zp, Rmax
+
+
+def make_regular_zoneplate(
+    pixel_size_m,
+    wavelength_m,
+    outer_zone_width_m,
+    focal_spot_diameter_m,
+    zp_radius_m=None,
+    central_stop=0.15,
+    zp_transmission=-1.0 + 0j,
+    oversample=8,
+    dtype=np.complex64,
+):
+    """The regular (classic, concentric-ring) zone plate itself: its
+    transmission function, on its own plane.
+
+    Deterministic counterpart to `make_randomized_zoneplate`: the textbook
+    Fresnel zone plate -- zone n spans wavelength_m*foc*n to
+    wavelength_m*foc*(n+1) in r^2, alternating open/`zp_transmission` -- in
+    place of a backpropagated-speckle-phase threshold. See
+    `_zoneplate_transmission` for the construction, including why the two
+    constructions can't share one implementation (thresholding a
+    backpropagated PLANE wave's phase would just inherit that finite
+    aperture's own Fresnel-diffraction ripple as spurious zone-boundary
+    jitter, not a clean zone plate -- the backpropagated-phase trick only
+    makes sense when the field doing the thresholding is also the
+    illumination, i.e. the randomized case).
+
+    Parameters are shared with `make_regular_zoneplate_probe` (see there for
+    details) minus `size`/`power`/`verbose`/`osa_edge_softness`/`device`,
+    which only apply to the probe. The zone-plate-plane grid size and pixel
+    pitch are derived from the inputs rather than given directly (chosen so
+    that propagating this plate's field forward by the focal length lands
+    exactly on a `pixel_size_m`-pitch grid -- see
+    `make_regular_zoneplate_probe`), so both are returned.
+
+    Returns
+    -------
+    zone_plate : numpy.ndarray
+        Complex transmission (including the central-stop/outer-edge
+        envelope), shape (n_zp, n_zp).
+    zp_pixel_size_m : float
+        Pixel pitch of `zone_plate`.
+    """
+    zone_plate, _field_zp, dx_zp, _foc, _r_zp, _bs_zp, _n_zp, _Rmax = _zoneplate_transmission(
+        pixel_size_m, wavelength_m, outer_zone_width_m, focal_spot_diameter_m,
+        zp_radius_m, central_stop, zp_transmission, oversample,
+    )
+    return zone_plate.astype(dtype), dx_zp
+
+
+def make_regular_zoneplate_probe(
+    size,
+    pixel_size_m,
+    wavelength_m,
+    outer_zone_width_m,
+    focal_spot_diameter_m,
+    zp_radius_m=None,
+    central_stop=0.15,
+    zp_transmission=-1.0 + 0j,
+    oversample=8,
+    osa_edge_softness=0.1,
+    power=1.0,
+    verbose=True,
+    device="cpu",
+    dtype=np.complex64,
+):
+    """Simulate the focal-spot probe of a regular (classic, concentric-ring)
+    Fresnel zone plate -- the deterministic counterpart to
+    `make_randomized_zoneplate_probe`.
+
+    Same optic equation and parameter surface as the randomized sibling
+    (minus `seed`, which has nothing to act on here), but a textbook zone
+    plate instead of a speckle-coded one:
+
+        1. Build the zone plate's transmission directly from the zone-radius
+           formula (see `_zoneplate_transmission`) on a grid chosen so that
+           propagating forward by the focal length lands exactly on a
+           `pixel_size_m`-pitch grid.
+        2. Illuminate it with a uniform plane wave (amplitude 1, phase 0).
+        3. Forward-propagate by `foc` to the focus/object plane (Fresnel).
+        4. Order-sorting aperture: the same soft-edged circular mask of
+           radius Rmax = focal_spot_diameter_m / 2 as the randomized
+           sibling, for the same reason -- a real zone plate sends the
+           undiffracted beam and every other diffraction order through as
+           well, and every real setup blocks them with a pinhole at the
+           focus. Here that background is a smooth, slowly-diverging field
+           rather than speckle, but it is not confined to the focal spot on
+           its own, so without this step most of a `verbose` run's reported
+           footprint would be stray background, not the real resolution.
+        5. Crop/pad to `size`, rescale total power.
+
+    Unlike the randomized probe, the result here is one near-diffraction-
+    limited spot (Airy-like, FWHM set by `outer_zone_width_m`, NOT by
+    `focal_spot_diameter_m`) sitting inside a much larger, dim halo of
+    unfocused light that the OSA didn't fully exclude. So
+    `focal_spot_diameter_m` plays the same role in the call signature as it
+    does for the randomized sibling (the zone plate's own default clear-
+    aperture radius, and the OSA diameter), it just does NOT describe the
+    size of the bright spot itself the way it does there. See
+    `make_randomized_zoneplate_probe` for the parameters shared between the
+    two; only the differences are called out below.
+
+    Parameters
+    ----------
+    size, pixel_size_m, wavelength_m, outer_zone_width_m, focal_spot_diameter_m,
+    zp_radius_m, central_stop, zp_transmission, oversample, osa_edge_softness,
+    power, device, dtype
+        Shared with `make_randomized_zoneplate_probe`; see there.
+    verbose
+        Print a diagnostic report (focal length, grid, central-spot FWHM
+        against the diffraction limit) -- unlike the randomized sibling,
+        there is one dominant spot here rather than speckle grains, so FWHM
+        (via the same `_fwhm` helper `make_probe`'s own verbose block uses)
+        is the natural metric instead of a power-containment radius.
+
+    Returns
+    -------
+    numpy.ndarray
+        Complex probe, shaped (1, 1, size, size) like `make_disk_probe`.
+    """
+    zone_plate, field_zp, dx_zp, foc, r_zp, bs_zp, n_zp, Rmax = _zoneplate_transmission(
+        pixel_size_m, wavelength_m, outer_zone_width_m, focal_spot_diameter_m,
+        zp_radius_m, central_stop, zp_transmission, oversample,
+    )
+    field_after_zp = field_zp * zone_plate
+
+    # forward-propagate to the focus/object plane; res_out == pixel_size_m
+    # exactly, by construction of dx_zp in `_zoneplate_transmission`.
+    probe_full, res_out = _fresnel_propagate(field_after_zp, foc, dx_zp, wavelength_m, device)
+
+    # order-sorting aperture -- see the docstring; same mechanism and reason
+    # as `make_randomized_zoneplate_probe`.
+    if osa_edge_softness > 0:
+        Xo, Yo = _grid(n_zp, res_out)
+        Ro = np.hypot(Xo, Yo)
+        probe_full = probe_full * _soft_step(Ro, Rmax, osa_edge_softness * Rmax)
+
+    # crop/pad, rescale power
+    probe = center_crop_or_pad(probe_full, size)
+    if power is not None:
+        probe = probe * np.sqrt(power / max((np.abs(probe) ** 2).sum(), 1e-300))
+    probe = probe.astype(dtype)
+
+    if verbose:
+        inten = (np.abs(probe) ** 2).astype(np.float64)
+        prof_x = inten.sum(axis=0)
+        coord = (np.arange(size) - size // 2) * pixel_size_m
+        spot_fwhm = _fwhm(coord, prof_x)
+        fwhm_msg = f"{spot_fwhm * 1e9:.1f} nm" if np.isfinite(spot_fwhm) else "n/a"
+        print(
+            f"regular zone plate: outer zone {outer_zone_width_m * 1e9:.1f} nm, "
+            f"zp radius {r_zp * 1e6:.3f} um, central stop {central_stop:.2f}, "
+            f"focal length {foc * 1e3:.3f} mm\n"
+            f"  zone-plate-plane grid {n_zp}x{n_zp} px at {dx_zp * 1e9:.2f} nm/px "
+            f"(object-plane pixel {res_out * 1e9:.4f} nm vs input "
+            f"{pixel_size_m * 1e9:.4f} nm)\n"
+            f"  focal spot FWHM ~ {fwhm_msg} (diffraction limit "
+            f"~{1.22 * outer_zone_width_m * 1e9:.0f} nm), "
+            f"OSA aperture {focal_spot_diameter_m * 1e6:.2f} um"
+        )
+
+    return probe[None, None]
+
+
 def _square_mode_orders(n_modes):
     """(a, b) exponent pairs in square order: (0,0), (1,0), (0,1), (1,1), ...
 
