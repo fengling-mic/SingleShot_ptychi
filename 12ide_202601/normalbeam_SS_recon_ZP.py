@@ -52,6 +52,7 @@ from utils import (
     save_rpi_reconstruction,
     siemens_star,
     simulate_rpi_diffraction,
+    crop_at_position
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -83,7 +84,7 @@ init_recon_file = (
 out_dir = Path("/mnt/micdata3/fengling/2026_01_results") / "singleframe_recons"
 recon_dir_suffix = ""            # appended to the folder name, e.g. "_v2" or "_pos"
 
-frame_index = 62   # index into the loaded scan's patterns/positions to reconstruct
+frame_index = 112   # index into the loaded scan's patterns/positions to reconstruct
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -92,7 +93,7 @@ with h5py.File(para_file, "r") as f:
     ppy = np.asarray(f["ppY"][()], dtype=np.float64).squeeze()
     energy_kev = np.asarray(f["energy"][()], dtype=np.float32).squeeze()
     detector_distance_m = np.asarray(f["detector_distance"][()], dtype=np.float32).squeeze()
-    exposure_time_ms = np.asarray(f["exposure_time_s"][()], dtype=np.float32).squeeze()
+    # exposure_time_ms = np.asarray(f["exposure_time_s"][()], dtype=np.float32).squeeze()
 
 
 #%% ---------------------------------------------------------------- geometry & knobs
@@ -120,7 +121,7 @@ rpi_kp_quantile = 0.95           # fraction of probe far-field power used to def
 
 # --- optimizer --------------------------------------------------------------
 rpi_optimizer_cls = torch.optim.Adam
-num_epochs = 4000                # max optimizer iterations per restart
+num_epochs = 20000                # max optimizer iterations per restart
 rpi_lr = 0.005                    # Adam step on an object of magnitude ~1
 rpi_lr_decay_factor = 0.5
 rpi_lr_decay_patience = 100      # if loss doesn't improve for this many epochs, decay lr*0.5
@@ -132,7 +133,7 @@ rpi_init_sigma = 0.1             # init noise std ("random" uses 1.0 per the pap
 rpi_background_counts = 0.0      # known detector background (Eq. 2's B_ij), if any
 
 # --- saving -------------------------------------------------------------
-save_freq_iterations = 1000       # write a recon_Niter*.h5 snapshot every N epochs (per restart)
+save_freq_iterations = 10000       # write a recon_Niter*.h5 snapshot every N epochs (per restart)
 
 # --- staged probe update ----------------------------------------------------
 # Set rpi_probe_start = 200 to freeze the probe for 200 iterations and then refine it.
@@ -194,6 +195,7 @@ if init_recon_file is not None:
     with h5py.File(init_recon_file, "r") as f:
         print(f"keys in {init_recon_file.name}: {list(f.keys())}")
         prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
+        prior["object"] = np.asarray(f["object"][()]).view(np.complex64)
         prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
 
 if "positions_px" in prior:
@@ -380,18 +382,19 @@ probe_far = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, 
     .sum(0).cpu().numpy()
 obj_far = np.abs(np.fft.fftshift(np.fft.fft2(obj_lowres_init_np))) ** 2
 
+#%%
 # Independent floors (in normalized-intensity units, i.e. decades below the peak): the
 # object's initial spectrum is nearly all DC + a flat noise floor (no real structure yet),
 # so it needs a much shallower floor than the probe to show that floor as texture instead
 # of crushing the whole square to one inferno color.
-probe_log_floor = 1e-3
-obj_log_floor = 1e-1
+probe_log_floor = 1e-2
+obj_log_floor = 1e-10
 probe_far_n = np.maximum(probe_far / probe_far.max(), probe_log_floor)
 obj_far_n = np.maximum(obj_far / obj_far.max(), obj_log_floor)
 
 n_half = n_dp / 2
 fig, ax = plt.subplots(figsize=(6.5, 5.5))
-im_probe = ax.imshow(np.log10(probe_far_n), cmap="gray", origin="lower",
+im_probe = ax.imshow(np.log10(probe_far_n), cmap="inferno", origin="lower",
                      vmin=np.log10(probe_log_floor), vmax=0,
                      extent=[-n_half, n_half, -n_half, n_half])
 # im_obj = ax.imshow(np.log10(obj_far_n), cmap="inferno", origin="lower", alpha=0.8,
@@ -402,12 +405,12 @@ fig.colorbar(im_probe, ax=ax, location="right", fraction=0.046, pad=0.04,
 #                         label="object log10(I / I_max)")
 # cbar_obj.ax.yaxis.set_ticks_position("left")
 # cbar_obj.ax.yaxis.set_label_position("left")
-ax.add_patch(plt.Circle((0, 0), kp, fill=False, color="C0", lw=1.5,
-                        label=f"kp = {kp} px  (circle, {rpi_kp_quantile:g} quantile)"))
-ax.add_patch(plt.Rectangle((-kp, -kp), 2 * kp, 2 * kp, fill=False, color="C1", lw=1.5,
-                           label=f"2kp x 2kp = {2 * kp} px  (circumscribing box)"))
-ax.add_patch(plt.Rectangle((-ko, -ko), 2 * ko, 2 * ko, fill=False, color="C2", lw=2,
-                           label=f"2ko x 2ko = {n_obj_lowres} px  (n_obj_lowres, R = {achieved_R:.2f})"))
+# ax.add_patch(plt.Circle((0, 0), kp, fill=False, color="C0", lw=1.5,
+#                         label=f"kp = {kp} px  (circle, {rpi_kp_quantile:g} quantile)"))
+# ax.add_patch(plt.Rectangle((-kp, -kp), 2 * kp, 2 * kp, fill=False, color="C1", lw=1.5,
+#                            label=f"2kp x 2kp = {2 * kp} px  (circumscribing box)"))
+# ax.add_patch(plt.Rectangle((-ko, -ko), 2 * ko, 2 * ko, fill=False, color="C2", lw=2,
+#                            label=f"2ko x 2ko = {n_obj_lowres} px  (n_obj_lowres, R = {achieved_R:.2f})"))
 lim = 2 * kp
 ax.set_xlim(-lim, lim)
 ax.set_ylim(-lim, lim)
@@ -417,9 +420,91 @@ ax.axvline(0, color="0.85", lw=0.5, zorder=0)
 ax.set_xlabel("kx [detector px]")
 ax.set_ylabel("ky [detector px]")
 ax.set_title("RPI band-limit geometry in reciprocal space")
-ax.legend(fontsize=8, loc="upper right")
+# ax.legend(fontsize=8, loc="upper right")
 plt.tight_layout()
-fig.savefig(recon_dir / "bandlimit_init.png", dpi=120, bbox_inches="tight")
+# fig.savefig(recon_dir / "bandlimit_init.png", dpi=120, bbox_inches="tight")
+plt.show()
+
+
+#%% define the oversampling factor for the imaging plane,
+# oversampling_ratio = wavelength * sample2detector_distance / (detector_pixel_size * probe_FoV)
+#                     = (n_dp * pixel_size_m) / probe_FoV   [since pixel_size_m = wavelength*dist/(n_dp*det_pixel_m)]
+# i.e. the classical CDI oversampling ratio: (real-space FOV the detector sampling implies)
+# / (the probe's actual illuminated footprint), using the already-computed illuminated-FOV
+# threshold crossing (rpi_illumination_threshold) as probe_FoV. Collapses the (possibly
+# slightly non-circular) row/col illuminated extents to one scalar via their average --
+# swap for max(...) below if you want the more conservative (smaller) number instead.
+diff_intensity = (measured * mask).cpu().numpy()
+
+# Reconstructed/simulated diffraction pattern: forward-model prediction E~ = F{P.O} using the
+# best available object -- the prior ptychography reconstruction, cropped to this frame's scan
+# position via crop_at_position, when available; otherwise the RPI object's own (near-unity,
+# not-yet-optimized) initial guess. Comparing this against the measured pattern (same color
+# scale) is a sanity check on the probe calibration and position before running RPI at all.
+if "object" in prior:
+    obj_patch_np, obj_patch_center = crop_at_position(
+        prior["object"].squeeze(0), position_px, (n_dp, n_dp)
+    )
+    obj_patch = torch.as_tensor(obj_patch_np, dtype=get_default_complex_dtype(), device=torch_device)
+else:
+    with torch.no_grad():
+        obj_patch = fourier_upsample_object(obj_lowres, n_dp)
+with torch.no_grad():
+    reconstructed_diff = simulate_rpi_diffraction(
+        obj_patch, probe_modes, n_dp, rpi_background_counts
+    ).cpu().numpy()
+
+probe_fov_px = 0.5 * ((ill_rows[-1] - ill_rows[0] + 1) + (ill_cols[-1] - ill_cols[0] + 1))
+probe_fov_m = probe_fov_px * pixel_size_m
+oversampling_ratio = wavelength_m * det_dist_m / (det_pixel_m * probe_fov_m)
+print(f"  probe FoV (> {rpi_illumination_threshold:g} of peak): {probe_fov_px:.1f} px "
+      f"= {probe_fov_m * 1e6:.2f} um")
+print(f"  oversampling ratio = wavelength*dist/(det_pixel*probe_FoV) = {oversampling_ratio:.3f} "
+      f"(classical finite-support CDI wants >= ~2)")
+
+#%% Plot the measured diffraction pattern, the reconstructed/simulated one, and the probe
+# illumination side by side, in each plane's own physical units (detector-plane mm, sample-plane
+# um), with a box marking the illuminated region (probe_fov_px) used as the denominator above.
+# measured and reconstructed share one color scale (normalized to the MEASURED peak) so any
+# intensity mismatch between them -- not just shape -- is visible.
+diff_floor = 1e-3
+diff_peak = diff_intensity.max()
+diff_norm = np.maximum(diff_intensity / diff_peak, diff_floor)
+recon_norm = np.maximum(reconstructed_diff / diff_peak, diff_floor)
+
+diff_extent_mm = n_dp / 2 * det_pixel_m * 1e3
+ill_extent_um = n_dp / 2 * pixel_size_m * 1e6
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+im0 = axes[0].imshow(np.log10(diff_norm), cmap="inferno", origin="lower",
+                     vmin=np.log10(diff_floor), vmax=0,
+                     extent=[-diff_extent_mm, diff_extent_mm, -diff_extent_mm, diff_extent_mm])
+fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label="log10(I / I_max,measured)")
+axes[0].set_xlabel("mm"), axes[0].set_ylabel("mm")
+axes[0].set_title("measured diffraction pattern")
+
+im_recon = axes[1].imshow(np.log10(recon_norm), cmap="inferno", origin="lower",
+                          vmin=np.log10(diff_floor), vmax=0.2,
+                          extent=[-diff_extent_mm, diff_extent_mm, -diff_extent_mm, diff_extent_mm])
+fig.colorbar(im_recon, ax=axes[1], fraction=0.046, pad=0.04, label="log10(I / I_max,measured)")
+axes[1].set_xlabel("mm"), axes[1].set_ylabel("mm")
+axes[1].set_title("reconstructed diffraction pattern\n(F{P.O}, O = prior ptychography object)")
+
+im2 = axes[2].imshow(illumination, cmap="inferno", origin="lower", vmin=0, vmax=0.7,
+                     extent=[-ill_extent_um, ill_extent_um, -ill_extent_um, ill_extent_um])
+x0 = (ill_cols[0] - n_dp / 2) * pixel_size_m * 1e6
+y0 = (ill_rows[0] - n_dp / 2) * pixel_size_m * 1e6
+width = (ill_cols[-1] - ill_cols[0] + 1) * pixel_size_m * 1e6
+height = (ill_rows[-1] - ill_rows[0] + 1) * pixel_size_m * 1e6
+axes[2].add_patch(plt.Rectangle((x0, y0), width, height, fill=False, color="tab:cyan", lw=1.5,
+                                label=f"probe FoV = {probe_fov_m * 1e6:.2f} um"))
+axes[2].legend(fontsize=8, loc="upper right")
+fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label="I / I_max")
+axes[2].set_xlabel("um"), axes[2].set_ylabel("um")
+axes[2].set_title("probe illumination |P|^2")
+
+fig.suptitle(f"oversampling ratio = {oversampling_ratio:.3f}")
+plt.tight_layout()
 plt.show()
 
 

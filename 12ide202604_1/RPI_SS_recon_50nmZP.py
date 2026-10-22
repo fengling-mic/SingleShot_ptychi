@@ -456,12 +456,13 @@ print(f"  probe FoV (> {rpi_illumination_threshold:g} of peak): {probe_fov_px:.1
 print(f"  oversampling ratio = wavelength*dist/(det_pixel*probe_FoV) = {oversampling_ratio:.3f} "
       f"(classical finite-support CDI wants >= ~2)")
 
+#%%
 # Plot the measured diffraction pattern, the reconstructed/simulated one, and the probe
 # illumination side by side, in each plane's own physical units (detector-plane mm, sample-plane
 # um), with a box marking the illuminated region (probe_fov_px) used as the denominator above.
 # measured and reconstructed share one color scale (normalized to the MEASURED peak) so any
 # intensity mismatch between them -- not just shape -- is visible.
-diff_floor = 1e-4
+diff_floor = 1e-5
 diff_peak = diff_intensity.max()
 diff_norm = np.maximum(diff_intensity / diff_peak, diff_floor)
 recon_norm = np.maximum(reconstructed_diff / diff_peak, diff_floor)
@@ -470,21 +471,21 @@ diff_extent_mm = n_dp / 2 * det_pixel_m * 1e3
 ill_extent_um = n_dp / 2 * pixel_size_m * 1e6
 
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-im0 = axes[0].imshow(np.log10(diff_norm), cmap="inferno", origin="lower",
+im0 = axes[0].imshow(np.log10(diff_norm[512-256:512+256, 512-256:512+256]), cmap="inferno", origin="lower",
                      vmin=np.log10(diff_floor), vmax=0,
                      extent=[-diff_extent_mm, diff_extent_mm, -diff_extent_mm, diff_extent_mm])
 fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label="log10(I / I_max,measured)")
 axes[0].set_xlabel("mm"), axes[0].set_ylabel("mm")
 axes[0].set_title("measured diffraction pattern")
 
-im_recon = axes[1].imshow(np.log10(recon_norm), cmap="inferno", origin="lower",
+im_recon = axes[1].imshow(np.log10(recon_norm[512-256:512+256, 512-256:512+256]), cmap="inferno", origin="lower",
                           vmin=np.log10(diff_floor), vmax=0,
                           extent=[-diff_extent_mm, diff_extent_mm, -diff_extent_mm, diff_extent_mm])
 fig.colorbar(im_recon, ax=axes[1], fraction=0.046, pad=0.04, label="log10(I / I_max,measured)")
 axes[1].set_xlabel("mm"), axes[1].set_ylabel("mm")
 axes[1].set_title("reconstructed diffraction pattern\n(F{P.O}, O = prior ptychography object)")
 
-im2 = axes[2].imshow(illumination, cmap="inferno", origin="lower", vmin=0, vmax=1,
+im2 = axes[2].imshow(illumination, cmap="inferno", origin="lower", vmin=0, vmax=0.5,
                      extent=[-ill_extent_um, ill_extent_um, -ill_extent_um, ill_extent_um])
 x0 = (ill_cols[0] - n_dp / 2) * pixel_size_m * 1e6
 y0 = (ill_rows[0] - n_dp / 2) * pixel_size_m * 1e6
