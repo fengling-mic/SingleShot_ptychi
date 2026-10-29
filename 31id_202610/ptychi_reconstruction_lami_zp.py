@@ -14,7 +14,9 @@ import h5py
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter
+from matplotlib.colors import LogNorm
+from matplotlib.patches import Circle, Rectangle
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from utils import center_crop_or_pad,show_ptychogram,make_regular_zoneplate_probe,hermite_secondary_modes
 
@@ -34,46 +36,67 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 #%% ---------------------------------------------------------------- paths
 
-scan = "S0019"
-scan_initialGuess = "S0019"  # scan used to generate the initial guess (positions + probe)
-# On the beamline (Linux) the shares are /mnt/micdata2 and /mnt/micdata3;
-# here on Windows the same shares are \\micdata\data2 and \\micdata\data3.
-data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test")
-# data_root = Path(r"\\micdata\data2\12IDC\2026_Data\2026_3\01_piezo_test")
+scan = "S0006"
 
-dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.hdf5"
-para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
+data_root = Path("/home/beams/FENGLING.ZHANG/Downloads")
 
-# Previous Pty-Chi recon used as the source of positions and of the probe guess
-# (same file the fracPy script read). Set to None to start from the para file
-# positions and a synthesized probe instead.
-init_recon_file = (
-    data_root / "ptychi_recons" / scan_initialGuess
-    / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
-)
+dp_file = data_root / "scan_00006.h5"        # summed Citius patterns (sum_dwells.py), read-only
+position_data = data_root / "scan_00006.dat"  # measured scan positions [um], one row per point
 
-# init_recon_file = None
-
-out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
+out_dir = Path("/mnt/micdata3/fengling/2026_31id_results") / "ptychi_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_initprobe_fromzpOSA_GS_eswonj_stepsize"            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_"            # appended to the folder name, e.g. "_v2" or "_pos"
 
-#%% ---------------------------------------------------------------- read the parameters from the file
-with h5py.File(para_file, "r") as f:
-    print(f"keys in {para_file.name}: {list(f.keys())}")
-    ppx = np.asarray(f["ppX"][()], dtype=np.float64).squeeze()
-    ppy = np.asarray(f["ppY"][()], dtype=np.float64).squeeze()
-    energy_kev = np.asarray(f["energy"][()], dtype=np.float32).squeeze()
-    detector_distance_m = np.asarray(f["detector_distance"][()], dtype=np.float32).squeeze()
-    exposure_time_ms = np.asarray(f["exposure_time_s"][()], dtype=np.float32).squeeze()
+#%% ---------------------------------------------------------------- read the summed Citius data and the measured scan positions
+# scan_00006.h5 (sum_dwells.py): each scan point is the sum of the ~435 raw Citius
+# frames recorded during that dwell. gzip-compressed, so plain h5py reads it.
+# The file is only ever opened read-only.
+
+with h5py.File(dp_file, "r") as f:
+    entry = f["entry"]
+    print(f"attributes of /entry in {dp_file.name}:")
+    for key, value in entry.attrs.items():
+        print(f"  {key} = {value}")
+    g = entry["data"]
+    print(f"datasets in /entry/data: {list(g.keys())}")
+    patterns_raw = g["data"][()]               # (n_points, rows, cols) summed counts, float32
+    frame_count = g["frame_count"][()]         # raw frames summed into each point
+    file_boundary = g["file_boundary"][()]     # 1 if the point spans a raw file/train boundary
+    edge_clipped = g["edge_clipped"][()]       # 1 if cut off by the start/end of acquisition
+    point_index = g["point_index"][()]         # point number, 0..n_points-1
+print(f"raw ptychogram: {patterns_raw.shape} {patterns_raw.dtype}, "
+      f"frames per point {frame_count.min()}-{frame_count.max()}")
+
+# The .h5 holds no positions; they come from the scan's .dat file. Line 1 is a
+# "Scan 00006, lsamrot_encoder ..." header, line 2 the column names.
+pos = np.genfromtxt(position_data, skip_header=1, names=True)
+assert len(pos) == len(patterns_raw), f"{len(pos)} positions vs {len(patterns_raw)} patterns"
+assert np.array_equal(pos["DataPoint"].astype(int), point_index), "DataPoint != point_index"
+
+# Points whose dwell spans a raw-file boundary are flagged by sum_dwells.py as
+# "may be clipped" (65 in S0006). With exclude_file_boundary = True they are
+# dropped from BOTH the patterns and the positions; False keeps them.
+exclude_file_boundary = False
+keep = edge_clipped == 0
+if exclude_file_boundary:
+    keep &= file_boundary == 0
+kept_index = point_index[keep]                 # original point number of each kept row
+is_boundary = file_boundary[keep].astype(bool) # per kept row: spans a file boundary
+print(f"keeping {int(keep.sum())} of {len(keep)} points "
+      f"({int(is_boundary.sum())} of them span a file boundary); "
+      f"excluding {int((~keep).sum())}: {np.flatnonzero(~keep).tolist()}")
+
+# measured positions of the kept points, (y, x) in um
+positions_um = np.stack((pos["Average_y_st_fzp"], pos["Average_x_st_fzp"]), axis=-1)[keep]
 
 
 #%% ---------------------------------------------------------------- geometry & knobs
 
-n_dp = 1024                          # detector crop
+energy_kev = 8.57 # trasfer from keV to meters         
+n_dp = 256                          # detector crop
 wavelength_m = 1.24e-9 / energy_kev # trasfer from keV to meters         
-det_pixel_m = 172e-6                # fracPy exampleData.dxd
-det_dist_m = detector_distance_m    # fracPy exampleData.zo
+det_pixel_m = 72.6e-6                # fracPy exampleData.dxd
+det_dist_m = 1.5    # fracPy exampleData.zo
 far_field = True                    # fracPy propagatorType 'Fraunhofer'
 
 # fracPy fixed dxo = dxp = 1.76e-8; that is exactly the far-field sampling below.
@@ -86,6 +109,21 @@ probe_focal_spot_diameter_m = 3.5e-6   # zone-plate aperture / OSA diameter (2*R
 probe_diameter_m = probe_focal_spot_diameter_m  # feeds the real-space support constraint below
 probe_outer_zone_width_m = 50e-9       # finest zone of the zone plate -- sets the focal-spot resolution
 probe_zp_central_stop = 0.15           # fraction of the simulated zone plate's radius blocked
+# The three zone-plate numbers above are used only by probe_init_method = "zoneplate_gs".
+# Checked against S0006: the donut's outer edge (~29-35 detector px, 1.45 mrad) gives an
+# outer zone of ~44-60 nm, so 50 nm is consistent; the hole/edge ratio gives a central
+# stop of ~0.24; 3.5 um is not the real zone-plate diameter (it sizes the toy plate and
+# the pinhole at its focus). That method makes an IN-FOCUS probe (~60 nm spot).
+
+# Initial probe:
+#   "data_defocus" -- measured beam far field (the pupil) + a defocus phase. Needs only
+#                     probe_defocus_m. Recommended: no optics model involved.
+#   "zoneplate_gs" -- the simulated zone plate above, far field fitted to the data by GS.
+probe_init_method = "data_defocus"
+# Sample distance from the focus. The speckle size inside the donut and the loss of
+# similarity between neighbouring patterns both put the probe at ~0.7-0.9 um across,
+# i.e. ~0.2-0.35 mm from the focus. The sign (before/after the focus) is unknown.
+probe_defocus_m = 0.25e-3
 
 # Rotation of the incoherent-mode basis. The reference's modes 1 and 2 are
 # two-lobe modes split along the diagonals (dipole axes -55.7 and +38.1 deg) and
@@ -101,7 +139,7 @@ probe_mode_rotation_deg = 38.0
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
 num_epochs = 5500
-save_freq_iterations = 500       # write a recon_Niter*.h5 snapshot every N epochs
+save_freq_iterations = 1000       # write a recon_Niter*.h5 snapshot every N epochs
 batch_size = 100                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
 noise_model = api.NoiseModels.GAUSSIAN  # fracPy params.noiseModel
@@ -130,12 +168,99 @@ print(f"pixel size = {pixel_size_m * 1e9:.3f} nm, FOV = {n_dp * pixel_size_m * 1
 
 #%% ---------------------------------------------------------------- load diffraction patterns
 
-with h5py.File(dp_file, "r") as f:
-    print(f"keys in {dp_file.name}: {list(f.keys())}")
-    patterns = f["dp"][()]
-print(f"raw ptychogram: {patterns.shape}")
+# Crop an n_dp x n_dp window centred on the donut. The zone plate's beam stop
+# makes every pattern a bright ring around a dark hole, and the crop is centred
+# on the middle of that hole. An intensity centroid is not used: the ring is
+# brighter along one side and pulls a centroid toward it.
+#
+# Hole finder, on the log of the lightly smoothed mean of the kept patterns:
+#   A. ring: cast rays from a start point, take the brightest radius on each ray,
+#      fit a circle through those points, repeat -- a stable start for step B;
+#   B. hole: on each ray, inside the ring, take the outermost radius that is still
+#      darker than halfway between the hole floor and the ring peak; fit a circle
+#      through those points, repeat.
+# The centre is rounded to whole pixels, so the data are never resampled.
+beam_centre_override = None      # (row, col) in the raw frame, to set the centre by hand
 
-patterns = center_crop_or_pad(patterns, n_dp)
+mean_pattern = np.mean(patterns_raw, axis=0, where=keep[:, None, None], dtype=np.float64)
+n_rows, n_cols = mean_pattern.shape
+
+
+def _fit_circle(y, x):
+    """Least-squares circle through the points (Kasa fit) -> (row, col, radius)."""
+    a = np.column_stack((2 * x, 2 * y, np.ones_like(x)))
+    cx, cy, c = np.linalg.lstsq(a, x**2 + y**2, rcond=None)[0]
+    return cy, cx, np.sqrt(c + cx**2 + cy**2)
+
+
+def find_donut_centre(image, start_rc, max_radius_px=60, n_rays=360, n_iter=5):
+    """Sub-pixel centre (row, col) and radius of the dark hole of a donut pattern."""
+    log_img = np.log10(np.maximum(gaussian_filter(image, 1.0), 1.0))
+    angles = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
+    sin_a, cos_a = np.sin(angles), np.cos(angles)
+    radii = np.arange(0, max_radius_px, 0.25)
+
+    def ray_profiles(cy, cx):
+        return map_coordinates(log_img, [cy + np.outer(sin_a, radii),
+                                         cx + np.outer(cos_a, radii)], order=1)
+
+    cy, cx = start_rc
+    for _ in range(n_iter):                                  # A. ring
+        r_ring = radii[np.argmax(ray_profiles(cy, cx), axis=1)]
+        cy, cx, _ = _fit_circle(cy + r_ring * sin_a, cx + r_ring * cos_a)
+    for _ in range(n_iter):                                  # B. hole
+        prof = ray_profiles(cy, cx)
+        r_edge = np.full(n_rays, np.nan)
+        for k, i_peak in enumerate(np.argmax(prof, axis=1)):
+            inner = prof[k, : i_peak + 1]
+            dark = np.flatnonzero(inner < 0.5 * (inner.min() + inner.max()))
+            if len(inner) >= 3 and len(dark):
+                r_edge[k] = radii[dark.max()]
+        ok = np.isfinite(r_edge)
+        cy, cx, radius = _fit_circle(cy + r_edge[ok] * sin_a[ok], cx + r_edge[ok] * cos_a[ok])
+    return cy, cx, radius
+
+
+# start point: intensity centroid in a window around the brightest pixel
+_r, _c = np.unravel_index(np.argmax(mean_pattern), mean_pattern.shape)
+for _ in range(2):
+    _rs = slice(max(_r - 64, 0), min(_r + 65, n_rows))
+    _cs = slice(max(_c - 64, 0), min(_c + 65, n_cols))
+    _w = mean_pattern[_rs, _cs]
+    _rr, _cc = np.mgrid[_rs, _cs]
+    _r, _c = int(round((_w * _rr).sum() / _w.sum())), int(round((_w * _cc).sum() / _w.sum()))
+
+donut_row, donut_col, donut_radius_px = find_donut_centre(mean_pattern, (_r, _c))
+if beam_centre_override is None:
+    beam_row, beam_col = int(round(donut_row)), int(round(donut_col))
+else:
+    beam_row, beam_col = (int(v) for v in beam_centre_override)
+
+
+def _crop_centred(stack, rows_to_keep, centre_rc, n):
+    """n x n window of the selected frames, centred on centre_rc. Parts of the
+    window that fall outside the frame stay zero; zero in every frame, they are
+    caught by the dead-pixel mask below and left out of the fit."""
+    out = np.zeros((int(np.count_nonzero(rows_to_keep)), n, n), dtype=np.float32)
+    r0, c0 = centre_rc[0] - n // 2, centre_rc[1] - n // 2
+    sr0, sr1 = max(r0, 0), min(r0 + n, stack.shape[1])
+    sc0, sc1 = max(c0, 0), min(c0 + n, stack.shape[2])
+    out[:, sr0 - r0:sr1 - r0, sc0 - c0:sc1 - c0] = stack[rows_to_keep, sr0:sr1, sc0:sc1]
+    return out
+
+
+crop_r0, crop_c0 = beam_row - n_dp // 2, beam_col - n_dp // 2   # crop origin in the raw frame
+patterns = _crop_centred(patterns_raw, keep, (beam_row, beam_col), n_dp)
+pad_rows = max(-crop_r0, 0) + max(crop_r0 + n_dp - n_rows, 0)
+pad_cols = max(-crop_c0, 0) + max(crop_c0 + n_dp - n_cols, 0)
+_inside = mean_pattern[max(crop_r0, 0):crop_r0 + n_dp, max(crop_c0, 0):crop_c0 + n_dp].sum()
+print(f"donut hole centre: row {donut_row:.2f}, col {donut_col:.2f}, radius "
+      f"{donut_radius_px:.1f} px -> crop centre row {beam_row}, col {beam_col}"
+      f"{' (override)' if beam_centre_override is not None else ''}")
+print(f"crop rows {crop_r0}:{crop_r0 + n_dp}, cols {crop_c0}:{crop_c0 + n_dp} of the "
+      f"{n_rows}x{n_cols} frame; zero-padded {pad_rows} rows, {pad_cols} cols; "
+      f"{100 * _inside / mean_pattern.sum():.3f}% of counts inside")
+
 if flip_dp_x:
     patterns = patterns[..., :, ::-1]
 if flip_dp_y:
@@ -169,24 +294,54 @@ print(
 
 # show_ptychogram(patterns, interactive=True)
 
-#%% ---------------------------------------------------------------- positions + prior probe/object
+# Check: crop box on the mean pattern, the donut in the middle of the crop, and
+# which scan points were dropped.
+fig, (ax_mean, ax_zoom, ax_pos) = plt.subplots(1, 3, figsize=(15, 5))
+ax_mean.imshow(mean_pattern, cmap="inferno", interpolation="nearest",
+               norm=LogNorm(vmin=1, vmax=float(mean_pattern.max())))
+ax_mean.add_patch(Rectangle(
+    (crop_c0 - 0.5, crop_r0 - 0.5), n_dp, n_dp, fill=False, edgecolor="cyan",
+    linewidth=1.5, label=f"{n_dp}x{n_dp} crop",
+))
+ax_mean.plot(beam_col, beam_row, "+", color="cyan", ms=12, mew=1.5, label="donut centre")
+ax_mean.set_title(f"mean of {int(keep.sum())} kept patterns (log)")
+ax_mean.legend(loc="upper right", fontsize=8)
 
+crop_mean = patterns.mean(axis=0)
+_hole_r, _hole_c = donut_row - crop_r0, donut_col - crop_c0     # fitted hole, crop coords
+if flip_dp_y:
+    _hole_r = n_dp - 1 - _hole_r
+if flip_dp_x:
+    _hole_c = n_dp - 1 - _hole_c
+ax_zoom.imshow(crop_mean, cmap="inferno", interpolation="nearest",
+               norm=LogNorm(vmin=max(float(crop_mean.min()), 1.0), vmax=float(crop_mean.max())))
+ax_zoom.axhline(n_dp // 2, color="cyan", lw=0.8)
+ax_zoom.axvline(n_dp // 2, color="cyan", lw=0.8)
+ax_zoom.add_patch(Circle((_hole_c, _hole_r), donut_radius_px, fill=False,
+                         edgecolor="lime", linewidth=1.2, label="fitted hole edge"))
+ax_zoom.set_xlim(n_dp // 2 - 40, n_dp // 2 + 40)
+ax_zoom.set_ylim(n_dp // 2 + 40, n_dp // 2 - 40)
+ax_zoom.set_title(f"cropped mean, zoom; crosshair = crop centre ({n_dp // 2}, {n_dp // 2})",
+                  fontsize=9)
+ax_zoom.legend(loc="upper right", fontsize=8)
+
+ax_pos.plot(pos["Average_x_st_fzp"][keep], pos["Average_y_st_fzp"][keep], "o", ms=3,
+            label=f"kept ({int(keep.sum())})")
+ax_pos.plot(pos["Average_x_st_fzp"][~keep], pos["Average_y_st_fzp"][~keep], "x",
+            color="tab:orange", ms=6, mew=1.5, label=f"excluded ({int((~keep).sum())})")
+ax_pos.set_aspect("equal")
+ax_pos.set_xlabel("x [um]"), ax_pos.set_ylabel("y [um]")
+ax_pos.set_title("measured scan positions")
+ax_pos.legend(loc="upper left", fontsize=8)
+plt.tight_layout()
+plt.show()
+
+#%% ---------------------------------------------------------------- positions
+
+# No initial-guess reconstruction: positions are the measured ones from the .dat
+# file, and the probe below is synthesized (`prior` stays empty).
 prior = {}
-if init_recon_file is not None:
-    with h5py.File(init_recon_file, "r") as f:
-        print(f"keys in {init_recon_file.name}: {list(f.keys())}")
-        # prior["object"] = np.asarray(f["object"][()]).view(np.complex64)
-        prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
-        prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
-
-if "positions_px" in prior:
-    positions_px = prior["positions_px"].copy()
-else:
-    with h5py.File(para_file, "r") as f:
-        print(f"keys in {para_file.name}: {list(f.keys())}")
-        ppx = np.asarray(f["ppX"][()], dtype=np.float64).squeeze()
-        ppy = np.asarray(f["ppY"][()], dtype=np.float64).squeeze()
-    positions_px = np.stack((ppy, ppx), axis=-1) / pixel_size_m
+positions_px = positions_um * 1e-6 / pixel_size_m    # um -> m -> object pixels
 
 if swap_position_axes:
     positions_px = positions_px[:, ::-1].copy()
@@ -223,8 +378,50 @@ if "probe" in prior:
     # (e.g. a wavelength axis) into the OPR axis.
     probe = probe.reshape((-1,) + probe.shape[-3:])
     probe = torch.as_tensor(np.ascontiguousarray(probe), dtype=get_default_complex_dtype())
-    print(f"probe from {init_recon_file.name}: {tuple(probe.shape)}")
+    print(f"probe from the initial-guess recon: {tuple(probe.shape)}")
 else:
+    # Beam far field, shared by both methods: a low percentile across positions
+    # keeps what every frame has in common (the beam) and suppresses the
+    # position-dependent object scatter. Gap-filled across dead/stuck pixels
+    # (normalized convolution: blur data*mask and mask separately, divide).
+    _percentile_10 = np.percentile(patterns, 10, axis=0)
+    _mask = valid_pixel_mask.astype(np.float32)
+    _num = gaussian_filter(_percentile_10 * _mask, sigma=3.0)
+    _den = gaussian_filter(_mask, sigma=3.0)
+    _gap_filled = np.where(valid_pixel_mask, _percentile_10, _num / np.maximum(_den, 1e-6))
+    _ff_amp = np.sqrt(np.fft.ifftshift(_gap_filled))       # FFT layout, DC = crop centre
+
+if "probe" not in prior and probe_init_method == "data_defocus":
+    # Probe straight from the data. The measured beam far field IS the zone
+    # plate's pupil -- cone edge, central-stop shadow and all -- so its amplitude
+    # needs no optics model. What the intensity cannot tell is how far the sample
+    # is from the focus; that enters as the Fresnel defocus phase on the pupil,
+    #     phi(u) = -pi * dz * u^2 / (lambda * L^2)
+    # for a detector offset u at distance L. Flipping the sign of dz (sample
+    # before vs after the focus) leaves the intensity unchanged, so either sign
+    # is a fair start; the reconstruction refines the phase from there.
+    _u = np.fft.fftfreq(n_dp, d=1.0 / n_dp) * det_pixel_m   # detector offset [m], FFT layout
+    _phi = -np.pi * probe_defocus_m * (_u[:, None] ** 2 + _u[None, :] ** 2) / (
+        wavelength_m * det_dist_m**2
+    )
+    _mode = np.fft.fftshift(np.fft.ifft2(_ff_amp * np.exp(1j * _phi)))
+    probe_init = _mode[None, None].astype(np.complex64)
+
+    # footprint: diameter of the disk (about the power centroid) holding 90 % of the power
+    _I = np.abs(_mode) ** 2
+    _yy, _xx = np.indices(_I.shape)
+    _rr = np.hypot(_yy - (_I * _yy).sum() / _I.sum(), _xx - (_I * _xx).sum() / _I.sum()).ravel()
+    _order = np.argsort(_rr)
+    _cum = np.cumsum(_I.ravel()[_order]) / _I.sum()
+    probe_d90_m = 2 * _rr[_order][np.searchsorted(_cum, 0.9)] * pixel_size_m
+    probe = torch.as_tensor(probe_init, dtype=get_default_complex_dtype())
+    print(f"probe from the measured beam far field, defocus {probe_defocus_m * 1e3:.3f} mm: "
+          f"90% of the power within {probe_d90_m * 1e6:.2f} um "
+          f"(window {n_dp * pixel_size_m * 1e6:.2f} um)")
+    if probe_d90_m > 0.5 * n_dp * pixel_size_m:
+        print("  WARNING: probe wider than half the window -- the far field is undersampled")
+
+elif "probe" not in prior and probe_init_method == "zoneplate_gs":
     probe_init = make_regular_zoneplate_probe(
         n_dp, pixel_size_m, wavelength_m,
         probe_outer_zone_width_m, probe_focal_spot_diameter_m,
@@ -263,13 +460,8 @@ else:
     # Filling the gaps first (normalized convolution: blur data*mask and
     # mask separately, divide) and imposing the result everywhere removes
     # the streaks while keeping the same ring match.
+    # (_gap_filled / _ff_amp: the shared beam far field computed above.)
     gs_iterations = 300
-    _percentile_10 = np.percentile(patterns, 10, axis=0)
-    _mask = valid_pixel_mask.astype(np.float32)
-    _num = gaussian_filter(_percentile_10 * _mask, sigma=3.0)
-    _den = gaussian_filter(_mask, sigma=3.0)
-    _gap_filled = np.where(valid_pixel_mask, _percentile_10, _num / np.maximum(_den, 1e-6))
-    _ff_amp = np.sqrt(np.fft.ifftshift(_gap_filled))
     _p = np.asarray(probe_init, dtype=np.complex64)
     _flat = _p.reshape(-1, n_dp, n_dp)
     for _i in range(_flat.shape[0]):
@@ -287,6 +479,36 @@ else:
           f"{probe_focal_spot_diameter_m * 1e6:.2f} um, outer zone "
           f"{probe_outer_zone_width_m * 1e9:.0f} nm, "
           f"far field matched to the data in {gs_iterations} GS iterations")
+
+elif "probe" not in prior:
+    raise ValueError(f"unknown probe_init_method {probe_init_method!r}")
+
+if "probe" not in prior:
+    # Check: mode 0 in real space, and its far field next to the measured beam.
+    _m0 = np.asarray(probe_init).reshape(-1, n_dp, n_dp)[0]
+    _amp0 = np.abs(_m0)
+    _far0 = np.fft.fftshift(np.abs(np.fft.fft2(_m0)) ** 2)
+    _far0 *= _gap_filled.sum() / _far0.sum()
+    _ext = np.array([-0.5, 0.5, 0.5, -0.5]) * n_dp * pixel_size_m * 1e6
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    axes[0].imshow(_amp0, cmap="inferno", extent=_ext)
+    axes[0].set_title(f"initial probe |mode 0| ({probe_init_method})", fontsize=9)
+    axes[1].imshow(np.where(_amp0 > 0.05 * _amp0.max(), np.angle(_m0), np.nan),
+                   cmap="twilight", extent=_ext)
+    axes[1].set_title("phase where |p| > 5% of max", fontsize=9)
+    for ax in axes[:2]:
+        ax.set_xlabel("x [um]"), ax.set_ylabel("y [um]")
+    _norm = LogNorm(vmin=max(float(_gap_filled[_gap_filled > 0].min()), 1.0),
+                    vmax=float(_gap_filled.max()))
+    axes[2].imshow(_gap_filled, cmap="inferno", norm=_norm)
+    axes[2].set_title("measured beam far field (10th percentile)", fontsize=9)
+    axes[3].imshow(_far0, cmap="inferno", norm=_norm)
+    axes[3].set_title("|FFT(mode 0)|^2", fontsize=9)
+    for ax in axes[2:]:
+        ax.set_xlim(n_dp // 2 - 60, n_dp // 2 + 60)
+        ax.set_ylim(n_dp // 2 + 60, n_dp // 2 - 60)
+    plt.tight_layout()
+    plt.show()
 
 # Incoherent modes: keep what we have, fill the rest with Hermite modes.
 if probe.shape[1] > n_probe_modes:
@@ -533,7 +755,11 @@ options.probe_options.fourier_support_constraint.enabled = True
 options.probe_options.fourier_support_constraint.optimization_plan = (
     OptimizationPlan(start=probe_start, stride=1)
 )
-options.probe_options.fourier_support_constraint.radius_px = 200
+# In far field the probe's FFT bins are detector pixels (independent of n_dp). The
+# measured beam cone reaches ~35-40 px from the centre (99.45% of the counts within
+# 35 px), so 45 px keeps the whole cone and cuts what lies outside it. (200 px was
+# no constraint at all for n_dp = 256: the farthest bin is ~181 px from DC.)
+options.probe_options.fourier_support_constraint.radius_px = 45
 
 # --- probe positions (fracPy pcPIE) ---
 if position_start is None:
