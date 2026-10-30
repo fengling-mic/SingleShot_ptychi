@@ -71,9 +71,9 @@ SYNTHETIC_ONLY = True (default) needs no beamline data and runs anywhere the pty
 installed -- use it to verify the physics. Set it False on the Linux host to add the two
 experimental probes from the prior LSQML reconstructions.
 
-Outputs (never overwrites; everything carries the dated suffix):
-    <out_dir>/probe_sensitivity_20261029.png
-    <out_dir>/probe_metrics_20261029.txt
+Outputs (never overwrites; every file carries the date stamp and the grid):
+    <out_dir>/probe_sensitivity_<STAMP>_n<n_dp>.png
+    <out_dir>/probe_metrics_<STAMP>_n<n_dp>.txt
 """
 
 #%% ------------------------------------------------------------------ imports + config
@@ -94,7 +94,8 @@ from utils import (
     simulate_rpi_diffraction,
 )
 
-STAMP = "20261029"
+STAMP = "20261030"   # bump per revision; outputs also carry the grid, so re-running at a
+                     # different n_dp never overwrites a previous result
 
 # The beamline shares are mounted at /mnt/... on the Linux host and reachable as UNC paths
 # from Windows. Branch rather than hardcode: on Windows, Path("/mnt/...").mkdir(parents=True)
@@ -112,7 +113,12 @@ max_modes = None               # cap incoherent modes on the experimental probes
                                # this is a GPU-headroom escape hatch, not a default.
 
 # Optic + geometry. Canonical set from 12ide202604_1/export_figs.py:7-13.
-n_dp                 = 1024
+# n_dp = 512 matches the reconstruction geometry of BOTH single-frame scripts now that
+# RPI_SS_recon_50nmZP_blrelax.py has moved to a 512 crop. Everything downstream is derived
+# from it, and fourier_resample holds the probe FOV fixed, so 1024 can be run unchanged as a
+# grid-independence cross-check: T(k) and F(k) are expressed against |k| in *detector*
+# pixels, which does not depend on this choice.
+n_dp                 = int(os.environ.get("PROBE_NDP", 512))
 det_pixel_m          = 172e-6
 det_dist_m           = 10.0
 wavelength_m         = 1.55e-10          # 8 keV
@@ -155,9 +161,14 @@ EXPERIMENTAL = {
         recon=DATA2 / "12IDC/2026_Data/2026_1/03_ptycho/ptychi_recons/S0040"
         / "Ndp512_LSQML_c50_m0.5_gaussian_p10_cp_mm_ic_pc1_f_ul2" / "recon_Niter1000.h5",
     ),
+    # The Ndp512 S0019 reconstruction, not the Ndp1024 one. Paired with the ZP's Ndp512
+    # S0040 run it gives the same detector crop, the same 4.4 mrad recorded angular range
+    # and the same iteration count -- removing the largest confound in the earlier
+    # comparison, where the RPI frame recorded twice the angular range of the ZP frame.
     "RPI (exp, S0019)": dict(
         recon=DATA2 / "12IDC/2026_Data/2026_3/01_piezo_test/ptychi_recons/S0019"
-        / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5",
+        / "Ndp512_LSQML_c150_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2_pd-0.15"
+        / "recon_Niter1000.h5",
     ),
 }
 
@@ -445,6 +456,25 @@ else:
           f"{kp['ZP (synth)']}/{kp['RPI (synth)']} px")
 
 
+# 7. The RPI band-limit heuristic R <= 0.94 should fall out of the classical sigma >= 2
+#    criterion rather than being an arbitrary safety margin. Object on a square n_obj grid
+#    (Fourier half-side ko), probe pupil a disk of radius kp: the exit-wave spectrum is
+#    their Minkowski sum, so the detector pixels carrying signal number
+#    4ko^2 + 8 ko kp + pi kp^2, against 2*n_obj^2 = 8 ko^2 REAL unknowns for a complex
+#    object. Requiring measurements >= sigma * unknowns and dividing through by kp^2 gives
+#        (8 sigma - 4) R^2 - 8 R - pi <= 0,   R = ko/kp
+#    whose positive root is the largest admissible R. This test asserts the arithmetic, so
+#    it fails loudly if the geometry assumptions above are ever edited.
+def r_max(sigma):
+    a, b, c = 8 * sigma - 4, -8.0, -math.pi
+    return (-b + math.sqrt(b * b - 4 * a * c)) / (2 * a)
+
+
+check("sigma>=2 reproduces R<=0.94", abs(r_max(2) - 0.944) < 0.01,
+      f"sigma>=1 -> R <= {r_max(1):.3f};  sigma>=2 -> R <= {r_max(2):.3f} "
+      f"(hardcoded heuristic 0.94, RPI_SS_recon_50nmZP.py:335)")
+
+
 #%% ------------------------------------------------------------------ figure
 out_dir.mkdir(parents=True, exist_ok=True)
 fig, axes = plt.subplots(2, 2, figsize=(11, 9))
@@ -533,7 +563,7 @@ for ax, idx, sym, scale, labels in (
     sec.set_xlabel("half-period  [nm]", fontsize=8)
 
 fig.tight_layout()
-fig_path = out_dir / f"probe_sensitivity_{STAMP}.png"
+fig_path = out_dir / f"probe_sensitivity_{STAMP}_n{n_dp}.png"
 fig.savefig(fig_path, dpi=120, bbox_inches="tight")
 print(f"wrote {fig_path}")
 
@@ -555,8 +585,9 @@ lines = [
     f"z={det_dist_m} m  NA={NA*1e3:.3f} mrad  kp_nominal={kp_nominal:.1f} px",
     f"all probes rescaled to {total_counts:.1e} counts; kp quantile forced to {kp_quantile}",
     "",
-    f"{'probe':<28}{'kp[px]':>8}{'theta_d[mrad]':>15}{'95% fp[px]':>12}"
-    f"{'det px<kp':>11}{'ratio':>10}{'T_hi/T_lo':>12}{'F_band':>12}",
+    f"{'probe':<28}{'kp[px]':>8}{'fp50':>8}{'fp95':>8}"
+    f"{'rho':>9}{'s_lin50':>9}{'s_lin95':>9}{'s_ar50':>9}{'s_ar95':>9}"
+    f"{'T_hi/T_lo':>12}{'F_band':>12}",
 ]
 
 
@@ -580,30 +611,67 @@ def f_band(label):
 
 for label, pm in probes.items():
     k_p = kp[label]
-    fp = footprint_px(pm)
+    fp50, fp = footprint_px(pm, 0.50), footprint_px(pm, 0.95)
+    # rho is what the first version of this table reported: detector pixels inside the
+    # pupil over object pixels inside the footprint. It is NOT the classical oversampling
+    # ratio -- its numerator counts only the direct-beam disk, so it is smaller by
+    # (2 kp / n_dp)^2 and cannot be compared with the literature's ">= 2". Reported here
+    # only so the two runs can be reconciled; sigma_lin / sigma_area are the real ones.
     n_det = math.pi * k_p ** 2
     n_obj = math.pi / 4 * fp ** 2
+    rho = n_det / max(n_obj, 1e-9)
+    s_lin50, s_lin95 = n_dp / max(fp50, 1e-9), n_dp / max(fp, 1e-9)
+    s_ar50, s_ar95 = 4 / math.pi * s_lin50 ** 2, 4 / math.pi * s_lin95 ** 2
     # Peak T says how much signal the probe makes in total, which is dominated by low k and
     # so does not answer the question that matters. T_hi/T_lo is the shape: how much of the
     # response survives out at high spatial frequency. It is dose-independent by
     # construction, so it compares probes directly.
     t_ratio = t_at(label, 1.5 * kp_nominal) / max(t_at(label, 0.2 * kp_nominal), 1e-300)
     lines.append(
-        f"{label:<28}{k_p:>8d}{k_p*det_pixel_m/det_dist_m*1e3:>15.3f}{fp:>12.1f}"
-        f"{n_det:>11.0f}{n_det/max(n_obj,1e-9):>10.2f}"
+        f"{label:<28}{k_p:>8d}{fp50:>8.0f}{fp:>8.0f}"
+        f"{rho:>9.3f}{s_lin50:>9.2f}{s_lin95:>9.2f}{s_ar50:>9.2f}{s_ar95:>9.2f}"
         f"{t_ratio:>12.3e}{f_band(label):>12.3e}")
-lines += ["", "ratio     = (detector px inside kp) / (object px inside 95% footprint),",
-          "            i.e. the oversampling ratio computed identically for every probe.",
-          "T_hi/T_lo = T(1.5 kp) / T(0.2 kp): fraction of the first-order response that",
-          "            survives to high spatial frequency. Dose-independent.",
-          "F_band    = mean shot-noise Fisher information over 0.2..1.5 kp, at matched",
-          "            total counts: information per unit dose.",
-          "",
-          "The 'rand phase' rows hold |A(q)| -- and therefore kp and the oversampling",
-          "ratio -- exactly fixed, and randomize only arg A(q). They isolate pupil phase",
-          "from every counting quantity.", ""]
+
+lines += [
+    "",
+    "fp50/fp95 = footprint diameter [object px] holding 50% / 95% of the probe power.",
+    "rho       = (det px inside kp)/(object px inside the 95% footprint). NOT the classical",
+    "            oversampling ratio -- the numerator counts only the direct-beam disk, so rho",
+    "            is smaller by (2 kp/n_dp)^2 and must NOT be compared with the '>= 2'",
+    "            threshold. Reported only to reconcile with the first version of this table:",
+    "                sigma_lin = (n_dp / 2 kp) * sqrt(rho)      [exact]",
+    "s_lin     = n_dp / footprint: the linear ratio of RPI_SS_recon_50nmZP.py:453. The",
+    "            familiar support-doubling rule wants this >= 2.",
+    "s_ar      = (4/pi) * s_lin^2: Miao's degrees-of-freedom ratio, whose own threshold is",
+    "            also 2 (so s_lin >= sqrt(pi/2) ~ 1.25). These are DIFFERENT criteria that",
+    "            share the number 2; the 4/pi is the disk-vs-square support convention.",
+    "            Quoting both at 50% and 95% exposes how much the answer depends on where",
+    "            the support is cut -- for a probe with a halo, a great deal.",
+    "T_hi/T_lo = T(1.5 kp)/T(0.2 kp): fraction of the first-order response surviving to high",
+    "            spatial frequency. Dose-independent.",
+    "F_band    = mean shot-noise Fisher information over 0.2..1.5 kp at matched total",
+    "            counts: information per unit dose.",
+    "",
+    "The 'rand phase' rows hold |A(q)| -- and therefore kp and every counting quantity that",
+    "depends on the pupil -- exactly fixed, and randomize only arg A(q).",
+    "",
+]
+
+lines += [
+    "RPI band-limit ratio R = ko/kp, largest value admitted by each criterion:",
+    f"    support / heterodyne ceiling  (S_A ^ (S_A +- k) non-empty)   R <= 2",
+    f"    bare determinacy    sigma >= 1                               R <= {r_max(1):.3f}",
+    f"    classical CDI       sigma >= 2                               R <= {r_max(2):.3f}",
+    "",
+    "The last line reproduces the 0.94 hardcoded at RPI_SS_recon_50nmZP.py:335, so that",
+    "heuristic is the sigma >= 2 criterion for this geometry rather than an arbitrary",
+    "safety margin. Relaxing past it puts the reconstruction between sigma >= 2 and bare",
+    "determinacy: formally solvable, no redundancy, workable only because the probe is",
+    "known and strongly structured.",
+    "",
+]
 lines += report
-txt_path = out_dir / f"probe_metrics_{STAMP}.txt"
+txt_path = out_dir / f"probe_metrics_{STAMP}_n{n_dp}.txt"
 txt_path.write_text("\n".join(lines) + "\n")
 print("\n".join(lines))
 print(f"wrote {txt_path}")

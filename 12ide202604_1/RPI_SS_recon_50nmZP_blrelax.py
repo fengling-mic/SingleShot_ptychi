@@ -84,7 +84,7 @@ para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
 # synthesized probe instead.
 init_recon_file = (
     data_root / "ptychi_recons" / scan_initialGuess
-    / "Ndp512_LSQML_c150_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2pd-0.15" / "recon_Niter1000.h5"
+    / "Ndp512_LSQML_c150_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2_pd-0.15" / "recon_Niter1000.h5"
 )
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons"
