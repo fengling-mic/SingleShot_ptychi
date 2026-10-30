@@ -84,7 +84,7 @@ para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
 # synthesized probe instead.
 init_recon_file = (
     data_root / "ptychi_recons" / scan_initialGuess
-    / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
+    / "Ndp512_LSQML_c150_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2pd-0.15" / "recon_Niter1000.h5"
 )
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons"
@@ -105,7 +105,7 @@ with h5py.File(para_file, "r") as f:
 
 #%% ---------------------------------------------------------------- geometry & knobs
 
-n_dp = 1024                          # detector crop
+n_dp = 512                          # detector crop
 wavelength_m = 1.24e-9 / energy_kev # trasfer from keV to meters         
 det_pixel_m = 172e-6                # fracPy exampleData.dxd
 det_dist_m = detector_distance_m    # fracPy exampleData.zo

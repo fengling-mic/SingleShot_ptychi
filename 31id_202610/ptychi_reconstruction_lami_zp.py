@@ -45,7 +45,7 @@ position_data = data_root / "scan_00006.dat"  # measured scan positions [um], on
 
 out_dir = Path("/mnt/micdata3/fengling/2026_31id_results") / "ptychi_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_"            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_allpos_pc"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the summed Citius data and the measured scan positions
 # scan_00006.h5 (sum_dwells.py): each scan point is the sum of the ~435 raw Citius
@@ -765,7 +765,7 @@ options.probe_options.fourier_support_constraint.radius_px = 45
 if position_start is None:
     options.probe_position_options.optimizable = False
 else:
-    options.probe_position_options.optimizable = False
+    options.probe_position_options.optimizable = True
     options.probe_position_options.optimizer = api.Optimizers.SGD
     options.probe_position_options.step_size = 0.3
     options.probe_position_options.optimization_plan = OptimizationPlan(start=position_start)
