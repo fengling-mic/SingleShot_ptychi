@@ -1341,15 +1341,57 @@ def siemens_star(shape, n_spokes=24):
 # ---------------------------------------------------------------------------
 
 
-def probe_fourier_radius(probe_modes, quantile=0.95):
-    """kp in detector pixels: the radius of the probe's own far-field containing
-    `quantile` of its power. RPI's resolution ratio R = ko/kp is defined against this,
-    not against the detector's Nyquist frequency (= n_dp / 2)."""
+def probe_fourier_power(probe_modes):
+    """|A(q)|^2 summed over incoherent modes, fftshifted, as a numpy array."""
     ff = (torch.abs(torch.fft.fftshift(torch.fft.fft2(probe_modes), dim=(-2, -1))) ** 2)
-    ff = ff.sum(0).detach().cpu().numpy()
+    return ff.sum(0).detach().cpu().numpy()
+
+
+def probe_fourier_center(probe_modes=None, ff=None, valid=None):
+    """Intensity centroid (row, col) of the probe's far field, in detector pixels.
+
+    Pass either `probe_modes` or a precomputed `ff` from `probe_fourier_power`. `valid` is
+    an optional boolean detector mask; masked pixels are excluded from the centroid.
+
+    The direct beam is generally NOT centred on the detector crop -- the ROI centre is
+    chosen in preprocessing and lands a few pixels off. Measured on the 12-ID-C single-frame
+    probes: (-3.4, -4.3) px for the regular zone plate, (-5.2, -1.4) px for the randomized
+    one.
+    """
+    if ff is None:
+        ff = probe_fourier_power(probe_modes)
+    if valid is not None:
+        ff = ff * np.asarray(valid, dtype=ff.dtype)
     n = ff.shape[-1]
     yy, xx = np.mgrid[:n, :n]
-    r = np.hypot(yy - n / 2, xx - n / 2).astype(int)
+    total = max(ff.sum(), 1e-300)
+    return (yy * ff).sum() / total, (xx * ff).sum() / total
+
+
+def probe_fourier_radius(probe_modes, quantile=0.95, center=None, valid=None):
+    """kp in detector pixels: the radius of the probe's own far-field containing
+    `quantile` of its power. RPI's resolution ratio R = ko/kp is defined against this,
+    not against the detector's Nyquist frequency (= n_dp / 2).
+
+    center
+        (row, col) to measure the radial profile about. The default, None, uses the
+        measured intensity centroid (`probe_fourier_center`). Earlier versions of this
+        function hardcoded the array centre, which inflates kp whenever the direct beam is
+        off-centre -- by 2 px on the 12-ID-C S0040 probe. Pass `center=(n/2, n/2)`
+        explicitly to reproduce that older behaviour.
+    valid
+        Optional boolean detector mask (True = good pixel). Dead and inter-module pixels
+        otherwise enter the radial sums as if they carried signal, and are excluded from
+        the normalising total as well as the profile.
+    """
+    ff = probe_fourier_power(probe_modes)
+    if valid is not None:
+        ff = ff * np.asarray(valid, dtype=ff.dtype)
+    n = ff.shape[-1]
+    if center is None:
+        center = probe_fourier_center(ff=ff)
+    yy, xx = np.mgrid[:n, :n]
+    r = np.hypot(yy - center[0], xx - center[1]).astype(int)
     cum = np.cumsum(np.bincount(r.ravel(), ff.ravel()))
     return int(np.searchsorted(cum, quantile * cum[-1]))
 
