@@ -7,6 +7,7 @@ import h5py
 import matplotlib
 import numpy as np
 import torch
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 try:
@@ -1408,9 +1409,34 @@ def fourier_upsample_object(obj_lowres, n_full):
     return torch.fft.ifft2(torch.fft.ifftshift(padded), norm="ortho") * (n_full / n_low)
 
 
-def simulate_rpi_diffraction(obj_lowres, probe_modes, n_full, background):
-    """RPI forward model (Eq. 1): upsample -> multiply by probe -> propagate -> incoherent sum."""
-    exit_waves = fourier_upsample_object(obj_lowres, n_full) * probe_modes
+def _interp_complex(arr, size, mode):
+    # F.interpolate has no complex kernels, so carry real and imag as two channels.
+    kw = {"align_corners": False} if mode in ("bilinear", "bicubic") else {}
+    out = F.interpolate(torch.stack([arr.real, arr.imag])[None], size=(size, size),
+                        mode=mode, **kw)[0]
+    return torch.complex(out[0], out[1])
+
+
+def interp_upsample_object(obj_lowres, n_full, mode="bicubic"):
+    """Real-space alternative to `fourier_upsample_object`: interpolate the coarse object
+    grid up to n_full x n_full over the same field of view (each coarse pixel spans an
+    n_full/n_low block). `mode` is "nearest", "bilinear" or "bicubic". The band limit this
+    imposes is soft -- the kernel attenuates frequencies below the coarse Nyquist and leaks
+    images above it -- unlike the sharp square cutoff of Fourier zero-padding."""
+    return _interp_complex(obj_lowres, n_full, mode)
+
+
+def interp_downsample_object(obj, n_low):
+    """Block-average a complex object down to n_low x n_low, on the same pixel geometry
+    `interp_upsample_object` assumes."""
+    return _interp_complex(obj, n_low, "area")
+
+
+def simulate_rpi_diffraction(obj_lowres, probe_modes, n_full, background,
+                             upsample=fourier_upsample_object):
+    """RPI forward model (Eq. 1): upsample -> multiply by probe -> propagate -> incoherent sum.
+    `upsample(obj_lowres, n_full)` maps the coarse object to the detector grid."""
+    exit_waves = upsample(obj_lowres, n_full) * probe_modes
     # Unnormalized FFT, matching the convention the probe was rescaled against.
     far_field = torch.fft.fftshift(torch.fft.fft2(exit_waves), dim=(-2, -1))
     return (far_field.abs() ** 2).sum(0) + background
@@ -1662,23 +1688,34 @@ def _frc_crossing(freq, curve, threshold):
     return freq[i] + t * (freq[i + 1] - freq[i])
 
 
-def plot_frc(freq_per_m, curves, threshold=None, labels=None, title=None, ax=None):
+def plot_frc(freq_per_m, curves, threshold=None, labels=None, title=None, ax=None,
+             colors=None, resolution_in_label=False, legend_kwargs=None,
+             top_tick_spacing=0.07):
     """Plot one or more FRC curves vs. spatial frequency, with resolution (nm)
     on a twin top axis, and a threshold curve if given (e.g. from
     `frc_half_bit_threshold`). `curves` is a single 1D array or a sequence of
     them; prints and marks the threshold-crossing resolution for each.
+
+    `colors` gives one color per curve (None = matplotlib's cycle).
+    `resolution_in_label` appends each curve's crossing, e.g. " (96 nm)", to its legend
+    entry. `legend_kwargs` are merged over the default `{"fontsize": 8}`.
+    `top_tick_spacing` is the minimum gap between top-axis ticks as a fraction of the
+    frequency range; raise it for narrow figures so the labels don't collide.
     """
     if isinstance(curves, np.ndarray) and curves.ndim == 1:
         curves = [curves]
     if labels is None:
         labels = [f"curve {i}" for i in range(len(curves))]
+    if colors is None:
+        colors = [None] * len(curves)
 
     freq_per_um = freq_per_m * 1e-6
     fig = None
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 4.5))
-    for curve, label in zip(curves, labels):
-        line, = ax.plot(freq_per_um, curve, label=label)
+    for curve, label, color in zip(curves, labels, colors):
+        line, = ax.plot(freq_per_um, curve, color=color)
+        legend_label = label
         if threshold is not None:
             crossing = _frc_crossing(freq_per_m, curve, threshold)
             if crossing is not None and crossing > 0:
@@ -1686,18 +1723,21 @@ def plot_frc(freq_per_m, curves, threshold=None, labels=None, title=None, ax=Non
                 ax.axvline(crossing * 1e-6, color=line.get_color(), ls=":", lw=1.5, alpha=0.9)
                 print(f"  {label}: FRC crosses threshold at {crossing * 1e-6:.4f} 1/um "
                       f"-> resolution {res_nm:.1f} nm")
+                if resolution_in_label:
+                    legend_label = f"{label} ({res_nm:.0f} nm)"
             else:
                 print(f"  {label}: FRC never drops below threshold within the Nyquist range")
+        line.set_label(legend_label)
     if threshold is not None:
         thr_curve = threshold if not np.isscalar(threshold) else np.full_like(freq_per_um, threshold)
-        ax.plot(freq_per_um, thr_curve, "k--", lw=1, label="half-bit threshold")
+        ax.plot(freq_per_um, thr_curve, color="#52514e", ls="--", lw=1, label="Half-bit threshold")
 
-    ax.set_xlabel("spatial frequency [1/um]")
+    ax.set_xlabel("Spatial frequency (µm⁻¹)")
     ax.set_ylabel("FRC")
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlim(0, freq_per_um[-1])
     ax.axhline(0, color="0.8", lw=0.5, zorder=0)
-    ax.legend(fontsize=8)
+    ax.legend(**{"fontsize": 8, **(legend_kwargs or {})})
     if title:
         ax.set_title(title)
 
@@ -1729,12 +1769,12 @@ def plot_frc(freq_per_m, curves, threshold=None, labels=None, title=None, ax=Non
     # candidate whose frequency position would crowd/overlap the previous kept one.
     kept_nm, last_freq_um = [], -np.inf
     for nm, f in zip(candidate_nm[in_range], tick_freq_um[in_range]):
-        if f - last_freq_um >= 0.07 * freq_max_um:
+        if f - last_freq_um >= top_tick_spacing * freq_max_um:
             kept_nm.append(nm)
             last_freq_um = f
     secax.set_xticks(kept_nm)
     secax.set_xticklabels([f"{v:g}" for v in kept_nm])
-    secax.set_xlabel("resolution [nm]")
+    secax.set_xlabel("Resolution (nm)")
     if fig is not None:
         plt.tight_layout()
     return ax
@@ -2295,6 +2335,7 @@ def collect_rpi_params(cfg=None, **overrides):
         "n_opr_modes": k("n_opr_modes", 1),
         "rpi_resolution_ratio": k("rpi_resolution_ratio", None),
         "rpi_kp_quantile": k("rpi_kp_quantile", None),
+        "rpi_upsample_mode": k("rpi_upsample_mode", "fourier"),
         "rpi_relaxation_freq": k("rpi_relaxation_freq", None),
         "rpi_relax_start": k("rpi_relax_start", None),
         "rpi_relax_end": k("rpi_relax_end", None),

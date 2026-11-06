@@ -84,7 +84,7 @@ para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
 # synthesized probe instead.
 init_recon_file = (
     data_root / "ptychi_recons" / scan_initialGuess
-    / "Ndp512_LSQML_c150_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2pd-0.15" / "recon_Niter1000.h5"
+    / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
 )
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons"
@@ -105,7 +105,7 @@ with h5py.File(para_file, "r") as f:
 
 #%% ---------------------------------------------------------------- geometry & knobs
 
-n_dp = 512                          # detector crop
+n_dp = 1024                          # detector crop
 wavelength_m = 1.24e-9 / energy_kev # trasfer from keV to meters         
 det_pixel_m = 172e-6                # fracPy exampleData.dxd
 det_dist_m = detector_distance_m    # fracPy exampleData.zo
@@ -123,17 +123,17 @@ probe_diameter_m = 3.5e-6        # only used when no probe comes from init_recon
 # is the theoretical limit. Here kp ~ 87 px, so R = 0.5 gives an 88 px object at
 # ~102 nm pitch -- the same regime as the paper's own X-ray demo (70 px, 83 nm).
 # The 30 nm Siemens star features are below this limit and cannot be recovered.
-rpi_resolution_ratio = 0.4
+rpi_resolution_ratio = 0.5
 rpi_kp_quantile = 0.98           # fraction of probe far-field power used to define kp
 
 # --- optimizer --------------------------------------------------------------
 rpi_optimizer_cls = torch.optim.Adam
-num_epochs = 4000                # max optimizer iterations per restart
+num_epochs = 10000                # max optimizer iterations per restart
 rpi_lr = 0.005                    # Adam step on an object of magnitude ~1
 rpi_lr_decay_factor = 0.5
 rpi_lr_decay_patience = 100      # if loss doesn't improve for this many epochs, decay lr*0.5
-rpi_min_lr = 1e-5                # stop when lr decays below this
-rpi_loss_floor = 1e-9            # stop when loss falls below this
+rpi_min_lr = 1e-10                # stop when lr decays below this
+rpi_loss_floor = 1e-20            # stop when loss falls below this
 rpi_num_restarts = 1             # measured: the solution is init-independent here
 rpi_object_init = "unit"         # "unit" (1 + noise, a transmission object) or "random" (paper)
 rpi_init_sigma = 0.1             # init noise std ("random" uses 1.0 per the paper)
@@ -150,9 +150,9 @@ rpi_background_counts = 0.0      # known detector background (Eq. 2's B_ij), if 
 # tight-from-epoch-0 schedule that never re-enters the unconstrained phase. Set
 # rpi_relaxation_freq to None to disable relaxation entirely (fixed band limit, as in
 # the base script).
-rpi_relaxation_freq = 100
+rpi_relaxation_freq = 10000
 rpi_relax_start = 0
-rpi_relax_end = 1000
+rpi_relax_end = 10000
 rpi_relax_max_ratio = 0.94   # ceiling achieved_R grows back to WITHIN the relax window
 
 # --- saving -------------------------------------------------------------

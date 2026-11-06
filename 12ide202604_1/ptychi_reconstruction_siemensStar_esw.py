@@ -67,7 +67,7 @@ init_recon_file = (
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_goodinitProbe_esw"            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_goodinitProbe"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -129,14 +129,14 @@ probe_mode_rotation_deg = 38.0
 
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
-num_epochs = 1000
+num_epochs = 1500
 save_freq_iterations = 500       # write a recon_Niter*.h5 snapshot every N epochs
-batch_size = 120                 # the number of scan positions
+batch_size = 100                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
 noise_model = api.NoiseModels.GAUSSIAN  # fracPy params.noiseModel
-momentum_gain = 0              # fracPy params.momentumAcceleration
+momentum_gain = 0.25              # fracPy params.momentumAcceleration
 
-probe_start = 10                  # epoch at which the probe starts updating
+probe_start = 100                  # epoch at which the probe starts updating
 opr_start = 10                   # None disables OPR weight optimization
 position_start = None              # None disables position correction (fracPy pcPIE)
 orthogonalization_stride = 5     # fracPy params.orthogonalizationFrequency

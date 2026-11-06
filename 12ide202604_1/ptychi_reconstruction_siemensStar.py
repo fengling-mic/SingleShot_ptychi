@@ -17,7 +17,7 @@ use_inline_backend()             # Plot Viewer-compatible backend, in its own ce
 
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # This makes GPU N appear as GPU 0 to CuPy
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # This makes GPU N appear as GPU 0 to CuPy
 
 import logging
 from pathlib import Path
@@ -49,8 +49,8 @@ scan = "S0019"
 scan_initialGuess = "S0019"  # scan used to generate the initial guess (positions + probe)
 # On the beamline (Linux) the shares are /mnt/micdata2 and /mnt/micdata3;
 # here on Windows the same shares are \\micdata\data2 and \\micdata\data3.
-# data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test")
-data_root = Path(r"\\micdata\data2\12IDC\2026_Data\2026_3\01_piezo_test")
+data_root = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test")
+# data_root = Path(r"\\micdata\data2\12IDC\2026_Data\2026_3\01_piezo_test")
 
 dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.hdf5"
 para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
@@ -65,9 +65,9 @@ init_recon_file = (
 
 # init_recon_file = None
 
-# out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
-out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_edgeK200_objinit_objk100"            # appended to the folder name, e.g. "_v2" or "_pos"
+out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons"
+# out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
+recon_dir_suffix = "_goodinit"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -90,7 +90,7 @@ far_field = True                    # fracPy propagatorType 'Fraunhofer'
 # fracPy fixed dxo = dxp = 1.76e-8; that is exactly the far-field sampling below.
 pixel_size_m = wavelength_m * det_dist_m / (n_dp * det_pixel_m)
 
-n_probe_modes = 5                # fracPy reconstruction.npsm, mix-state modes
+n_probe_modes = 6                # fracPy reconstruction.npsm, mix-state modes
 n_opr_modes = 1                  # variable probe (OPR); 1 disables it
 probe_diameter_m = 3.95e-6       # only used when no probe comes from init_recon_file, works as entrance pupil
 probe_init_type = "disk"         # "disk" or "gaussian" (only used when no probe comes from init_recon_file)
@@ -129,8 +129,8 @@ probe_mode_rotation_deg = 38.0
 
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
-num_epochs = 500
-save_freq_iterations = 5000       # write a recon_Niter*.h5 snapshot every N epochs
+num_epochs = 1500
+save_freq_iterations = 500       # write a recon_Niter*.h5 snapshot every N epochs
 batch_size = 100                 # the number of scan positions
 batching_mode = api.BatchingModes.COMPACT
 noise_model = api.NoiseModels.POISSON
@@ -138,7 +138,7 @@ momentum_gain = 0.25              # fracPy params.momentumAcceleration
 
 probe_start = 100                  # epoch at which the probe starts updating
 opr_start = 10                   # None disables OPR weight optimization
-position_start = 10              # None disables position correction (fracPy pcPIE)
+position_start = None              # None disables position correction (fracPy pcPIE)
 orthogonalization_stride = 5     # fracPy params.orthogonalizationFrequency
 position_update_limit_px = 20.0
 optimize_intensity_variation = False   # per-position beam intensity ("ic")
@@ -205,7 +205,7 @@ if init_recon_file is not None:
     with h5py.File(init_recon_file, "r") as f:
         print(f"keys in {init_recon_file.name}: {list(f.keys())}")
         # prior["object"] = np.asarray(f["object"][()]).view(np.complex64)
-        # prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
+        prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
         prior["positions_px"] = np.asarray(f["positions_px"][()], dtype=np.float64)
 
 if "positions_px" in prior:
@@ -609,7 +609,7 @@ if position_start is not None:
 #     prior["probe"] = np.asarray(f["probe"][()]).view(np.complex64)
 # probe = center_crop_or_pad(prior["probe"], n_dp)
 # probe_det = np.fft.fftshift(np.fft.fft2(probe[0,0,:,:]))
-# plt.imshow(np.abs(probe_det))
+# plt.imshow(np.abs(probe_de/home/beams/FENGLING.ZHANG/t))
 
 
 #%% ---------------------------------------------------------------- save

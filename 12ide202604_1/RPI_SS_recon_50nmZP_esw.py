@@ -71,9 +71,9 @@ init_recon_file = (
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
-recon_dir_suffix = "_esw"            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_esw_1"            # appended to the folder name, e.g. "_v2" or "_pos"
 
-frame_index = 62   # index into the loaded scan's patterns/positions to reconstruct
+frame_index = 63   # index into the loaded scan's patterns/positions to reconstruct
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -109,12 +109,12 @@ rpi_kp_quantile = 0.95           # fraction of probe far-field power used to def
 
 # --- optimizer --------------------------------------------------------------
 rpi_optimizer_cls = torch.optim.Adam
-num_epochs = 4000                # max optimizer iterations per restart
+num_epochs = 10000                # max optimizer iterations per restart
 rpi_lr = 0.005                    # Adam step on an object of magnitude ~1
 rpi_lr_decay_factor = 0.5
 rpi_lr_decay_patience = 100      # if loss doesn't improve for this many epochs, decay lr*0.5
 rpi_min_lr = 1e-5                # stop when lr decays below this
-rpi_loss_floor = 1e-9            # stop when loss falls below this
+rpi_loss_floor = 0            # stop when loss falls below this
 rpi_num_restarts = 1             # measured: the solution is init-independent here
 rpi_object_init = "esw"          # "esw" (known-illumination ER estimate + noise), "unit" (1 + noise), or "random" (paper)
 rpi_init_sigma = 0.1             # init noise std ("random" uses 1.0 per the paper)

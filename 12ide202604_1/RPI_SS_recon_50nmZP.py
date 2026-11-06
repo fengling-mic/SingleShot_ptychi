@@ -70,16 +70,18 @@ para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.hdf5"
 # Prior multi-position Pty-Chi reconstruction used as the source of the probe and of
 # calibration positions. Set to None to start from the para file positions and a
 # synthesized probe instead.
-init_recon_file = (
-    data_root / "ptychi_recons" / scan_initialGuess
-    / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
-)
+# init_recon_file = (
+#     data_root / "ptychi_recons" / scan_initialGuess
+#     / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
+# )
+
+init_recon_file = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c100_m0.25_gaussian_p5_opr1_pc1_f_ul20_initprobe_fromzpOSA_GS_eswonj_stepsize" / "recon_Niter15500.h5"
 
 out_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons"
 # out_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons"
 recon_dir_suffix = ""            # appended to the folder name, e.g. "_v2" or "_pos"
 
-frame_index = 62   # index into the loaded scan's patterns/positions to reconstruct
+frame_index = 64   # index into the loaded scan's patterns/positions to reconstruct
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 with h5py.File(para_file, "r") as f:
@@ -117,7 +119,7 @@ rpi_kp_quantile = 0.95           # fraction of probe far-field power used to def
 # --- optimizer --------------------------------------------------------------
 rpi_optimizer_cls = torch.optim.Adam
 num_epochs = 4000                # max optimizer iterations per restart
-rpi_lr = 0.005                    # Adam step on an object of magnitude ~1
+rpi_lr = 0.01                    # Adam step on an object of magnitude ~1
 rpi_lr_decay_factor = 0.5
 rpi_lr_decay_patience = 100      # if loss doesn't improve for this many epochs, decay lr*0.5
 rpi_min_lr = 1e-5                # stop when lr decays below this
@@ -139,7 +141,7 @@ save_freq_iterations = 1000       # write a recon_Niter*.h5 snapshot every N epo
 # The Poisson noise floor is 0.0124, so every released run fits noise, and none improves
 # the object. Default off. Useful only if the probe may have drifted between the
 # calibration scan and the shot -- it has not here.
-rpi_probe_start = 10
+rpi_probe_start = 100
 rpi_probe_lr_rel = 0.001         # probe lr = this * mean|P| (probe entries are ~1e-3)
 rpi_probe_anchor = 3.0           # weight of ||P - P0||^2 / ||P0||^2 keeping P near calibration
 
