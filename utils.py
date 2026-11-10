@@ -1749,32 +1749,32 @@ def plot_frc(freq_per_m, curves, threshold=None, labels=None, title=None, ax=Non
         safe = np.where(f_per_um > 1e-9, f_per_um, 1e-9)
         return 1e3 / safe
 
-    secax = ax.secondary_xaxis("top", functions=(_um_to_nm, _um_to_nm))
-    # The 1/f transform blows up near f=0, which left to auto-ticking pulls in a
-    # ridiculous (1e11 nm) tick and its scientific-notation offset box. Curate the
-    # ticks instead, to round nm values that actually fall within the plotted range.
-    #
-    # Tick POSITIONS for a `functions=`-based secondary axis are in the secondary
-    # (child, here nm) units, not the parent's -- matplotlib applies the *inverse*
-    # function to place them back on the shared frequency axis. Passing frequency
-    # values here (an earlier version of this code did) silently drops every tick:
-    # they get placed via the forward function instead, which only by coincidence
-    # ever landed inside the visible range.
-    freq_max_um = freq_per_um[-1] if freq_per_um[-1] > 0 else 1.0
-    candidate_nm = np.array([2000, 1000, 500, 300, 200, 150, 100, 70, 50, 40,
-                             30, 25, 20, 15, 12, 10, 8, 6, 5, 4])
-    tick_freq_um = 1e3 / candidate_nm
-    in_range = (tick_freq_um >= 0.02 * freq_max_um) & (tick_freq_um <= freq_max_um)
-    # candidate_nm is in descending-nm (ascending-frequency) order; thin out any
-    # candidate whose frequency position would crowd/overlap the previous kept one.
-    kept_nm, last_freq_um = [], -np.inf
-    for nm, f in zip(candidate_nm[in_range], tick_freq_um[in_range]):
-        if f - last_freq_um >= top_tick_spacing * freq_max_um:
-            kept_nm.append(nm)
-            last_freq_um = f
-    secax.set_xticks(kept_nm)
-    secax.set_xticklabels([f"{v:g}" for v in kept_nm])
-    secax.set_xlabel("Resolution (nm)")
+    # secax = ax.secondary_xaxis("top", functions=(_um_to_nm, _um_to_nm))
+    # # The 1/f transform blows up near f=0, which left to auto-ticking pulls in a
+    # # ridiculous (1e11 nm) tick and its scientific-notation offset box. Curate the
+    # # ticks instead, to round nm values that actually fall within the plotted range.
+    # #
+    # # Tick POSITIONS for a `functions=`-based secondary axis are in the secondary
+    # # (child, here nm) units, not the parent's -- matplotlib applies the *inverse*
+    # # function to place them back on the shared frequency axis. Passing frequency
+    # # values here (an earlier version of this code did) silently drops every tick:
+    # # they get placed via the forward function instead, which only by coincidence
+    # # ever landed inside the visible range.
+    # freq_max_um = freq_per_um[-1] if freq_per_um[-1] > 0 else 1.0
+    # candidate_nm = np.array([2000, 1000, 500, 300, 200, 150, 100, 70, 50, 40,
+    #                          30, 25, 20, 15, 12, 10, 8, 6, 5, 4])
+    # tick_freq_um = 1e3 / candidate_nm
+    # in_range = (tick_freq_um >= 0.02 * freq_max_um) & (tick_freq_um <= freq_max_um)
+    # # candidate_nm is in descending-nm (ascending-frequency) order; thin out any
+    # # candidate whose frequency position would crowd/overlap the previous kept one.
+    # kept_nm, last_freq_um = [], -np.inf
+    # for nm, f in zip(candidate_nm[in_range], tick_freq_um[in_range]):
+    #     if f - last_freq_um >= top_tick_spacing * freq_max_um:
+    #         kept_nm.append(nm)
+    #         last_freq_um = f
+    # secax.set_xticks(kept_nm)
+    # secax.set_xticklabels([f"{v:g}" for v in kept_nm])
+    # secax.set_xlabel("Resolution (nm)")
     if fig is not None:
         plt.tight_layout()
     return ax

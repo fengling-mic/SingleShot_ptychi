@@ -31,7 +31,8 @@ import h5py
 import torch
 from pathlib import Path
 
-from scipy.ndimage import fourier_shift
+from scipy.ndimage import rotate
+from skimage.measure import profile_line
 from skimage.registration import phase_cross_correlation
 
 from utils import (
@@ -46,18 +47,18 @@ from utils import (
 )
 
 #%% FRC from multiple step scans
-step_recon_dir2 = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c100_m0.25_gaussian_p5_opr1_pc1_f_ul20_initprobe_fromzpOSA_GS_eswonj_stepsize" / "recon_Niter15500.h5"
-step_recon_dir1 = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c100_m0_gaussian_p5_opr1_pc0_goodinitProbe" / "recon_Niter500.h5"
-step_recon_dir3 = Path("/mnt/micdata2/12IDC/2026_Data/2026_3/01_piezo_test") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
-step_recon_dir4 = Path("/mnt/micdata3/fengling/2026_03_results") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c120_m0_gaussian_p5_opr1_pc0_goodinitProbe_esw" / "recon_Niter1000.h5"
+step_recon_dir1 = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c100_m0_gaussian_p5_opr1_pc0_goodinitProbe" / "recon_Niter500.h5"
+step_recon_dir2 = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c100_m0.25_gaussian_p5_opr1_pc1_f_ul20_initprobe_fromzpOSA_GS_eswonj_stepsize" / "recon_Niter15500.h5"
+step_recon_dir3 = Path(r"\\micdata\data2\12IDC\2026_Data\2026_3\01_piezo_test") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c20_m0.5_gaussian_p10_cp_mm_opr3_ic_pc1_f_ul2" / "recon_Niter400.h5"
+step_recon_dir4 = Path(r"\\micdata\data3\fengling\2026_03_results") / "ptychi_recons" / "S0019" / "Ndp1024_LSQML_c120_m0_gaussian_p5_opr1_pc0_goodinitProbe_esw" / "recon_Niter1000.h5"
 
 
 #%% FRC from single-frame ptychography
 # singleframe_recon_dir_bl = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons" / "S0019" / "frame62_RPI_Adam_Nobj84_R0.5_p10_opr1_prel10_esw_1" / "recon_Niter2000.h5"
-singleframe_recon_dir_nobl = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons" / "S0019" / "frame62_RPI_Adam_Nobj1024_R100_p10_opr1_prel10_esw_1" / "recon_Niter10000.h5"
-singleframe_recon_dir_blrelax = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons" / "S0019" / "frame62_RPI_Adam_Nobj72_R0.4_relax20_0-2000_p10_opr1_prel100_blrelax" / "recon_Niter10000.h5"
-# singleframe_recon_dir = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons" / "S0019" / "frame63_RPI_Adam_Nobj1024_R100_p10_opr1_prel10_esw_1" / "recon_Niter10000.h5"
-singleframe_recon_dir_bl = Path("/mnt/micdata3/fengling/2026_03_results") / "singleframe_recons" / "S0019" / "frame62_RPI_Adam_Nobj92_R0.5_relax10000_0-10000_p10_opr1_prel100_blrelax" / "recon_Niter10000.h5"
+singleframe_recon_dir_nobl = Path(r"\\micdata\data3\fengling\2026_03_results") / "singleframe_recons" / "S0019" / "frame62_RPI_Adam_Nobj1024_R100_p10_opr1_prel10_esw_1" / "recon_Niter10000.h5"
+singleframe_recon_dir_blrelax = Path(r"\\micdata\data3\fengling\2026_03_results") / "singleframe_recons" / "S0019" / "frame62_RPI_Adam_Nobj72_R0.4_relax20_0-2000_p10_opr1_prel100_blrelax" / "recon_Niter10000.h5"
+# singleframe_recon_dir = Path(r"\\micdata\data3\fengling\2026_03_results") / "singleframe_recons" / "S0019" / "frame63_RPI_Adam_Nobj1024_R100_p10_opr1_prel10_esw_1" / "recon_Niter10000.h5"
+singleframe_recon_dir_bl = Path(r"\\micdata\data3\fengling\2026_03_results") / "singleframe_recons" / "S0019" / "frame62_RPI_Adam_Nobj92_R0.5_relax10000_0-10000_p10_opr1_prel100_blrelax" / "recon_Niter10000.h5"
 
 
 singleframe_recons = {   # legend label -> recon file, in order of decreasing band limit
@@ -85,23 +86,6 @@ def load_step_recon(path):
     if obj.ndim == 3:
         obj = obj[0]
     return obj, positions_px, pixel_size_m
-
-
-def align_pair(img_a, img_b, upsample_factor=20):
-    """Cross-correlate on PHASE and Fourier-shift `img_b` onto `img_a`'s grid.
-    Returns (img_a, aligned_b, shift_rc).
-
-    Phase, not amplitude: the RPI single-frame amplitude has almost no structure, and
-    amplitude correlation locked onto a false peak ~220 px off.
-    (skimage's `error` return value is dropped -- under the default
-    `normalization="phase"` it saturates near 1.0 regardless of fit quality.)
-    """
-    shift, _error, _ = phase_cross_correlation(np.angle(img_a), np.angle(img_b),
-                                               upsample_factor=upsample_factor)
-    aligned_b = np.fft.ifft2(fourier_shift(np.fft.fft2(img_b), shift))
-    print(f"    registration shift (row, col) = ({shift[0]:+.2f}, {shift[1]:+.2f}) px")
-    return img_a, aligned_b, shift
-
 
 def lit_square(probe, threshold):
     """(row_slice, col_slice): square bbox of where sum_modes |probe|^2 exceeds `threshold`
@@ -172,46 +156,73 @@ print(f"  step-scan pixel sizes (dir1/dir2/dir3/dir4): "
       f"{dir3_pixel_size_m * 1e9:.4f} / {dir4_pixel_size_m * 1e9:.4f} nm")
 
 
-#%% ---------------------------------------------------------------- group 1 = dir1 + dir4, group 2 = dir2 + dir3
+#%% ---------------------------------------------------------------- group 1 = dir1 + dir4, group 2 = dir2 + dir3, align manually
 
 print("group 1: registering dir4 onto dir1:")
-_, dir4_aligned, _shift4 = align_pair(dir1_crop, dir4_crop)
+# dir4_aligned = rotate(dir4_crop, 0, reshape=False)
+dir4_aligned = np.roll(dir4_crop, -1,axis=1)
 group1 = 0.5 * (dir1_crop + dir4_aligned)
+
 print("group 2: registering dir3 onto dir2:")
-_, dir3_aligned, _shift3 = align_pair(dir2_crop, dir3_crop)
+dir3_aligned = np.roll(dir3_crop, -1,axis=1)
 group2 = 0.5 * (dir2_crop + dir3_aligned)
 
 #%% sanity check: do all groups show the same feature, before trusting the FRC?
-panels = [(group1, "dir1+dir4 (group 1)"), (group2, "dir2+dir3 (group 2)")]
-panels += [(obj, f"single-frame: {label}") for label, obj in sf_objects.items()]
-fig, axes = plt.subplots(2, len(panels), figsize=(3.8 * len(panels), 8))
-for col, (img, title) in enumerate(panels):
-    axes[0, col].imshow(np.abs(img), cmap="gray")
-    axes[0, col].set_title(f"{title}\n|O|", fontsize=9)
-    axes[1, col].imshow(np.angle(img), cmap="gray")
-    axes[1, col].set_title("phase", fontsize=9)
-for ax in axes.ravel():
-    ax.set_xticks([]), ax.set_yticks([])
-fig.suptitle(f"frame {frame_index} lit area ({lit_px} px): the reconstructions being compared")
-plt.tight_layout()
-plt.show()
-
-
-#%% ---------------------------------------------------------------- the FRC curves
+# panels = [(group1, "dir1+dir4 (group 1)"), (group2, "dir2+dir3 (group 2)"), (dir1_crop, "dir1"), (dir2_crop, "dir2"), (dir3_crop, "dir3"), (dir4_crop, "dir4")]
+# panels += [(obj, f"single-frame: {label}") for label, obj in sf_objects.items()]
+# fig, axes = plt.subplots(2, len(panels), figsize=(3.8 * len(panels), 8))
+# for col, (img, title) in enumerate(panels):
+#     axes[0, col].imshow(np.abs(img), cmap="gray")
+#     axes[0, col].set_title(f"{title}\n|O|", fontsize=9)
+#     axes[1, col].imshow(np.angle(img), cmap="gray")
+#     axes[1, col].set_title("phase", fontsize=9)
+# for ax in axes.ravel():
+#     ax.set_xticks([]), ax.set_yticks([])
+# fig.suptitle(f"frame {frame_index} lit area ({lit_px} px): the reconstructions being compared")
+# plt.tight_layout()
+# plt.show()
+#%% ---------------------------------------------------------------- the FRC curves for phase
 
 print("computing the FRC curves:")
 
 curves, labels, pixel_sizes = [], [], []
-for i, (label, sf_object) in enumerate(sf_objects.items(), start=1):
-    print(f"  {i}) dir1+dir4 vs {label}:")
-    _, sf_aligned, _ = align_pair(group1, sf_object)
-    freq, frc, n_per_ring = fourier_ring_correlation(np.angle(group1), np.angle(sf_aligned),
-                                                     pixel_size_m=sf_pixel_size[label])
-    curves.append(frc), labels.append(label), pixel_sizes.append(sf_pixel_size[label])
+sf_aligned = np.zeros_like(dir3_crop,shape=(3,408,408))   # same crop size for all single-frame reconstructions
+item_iterator = iter(enumerate(sf_objects.items(), start=1))
+
+i, (label, sf_object) = next(item_iterator)
+print(f"  {i}) dir3 vs {label}:")
+sf_aligned[0,:,:] = np.roll(sf_object,(2,2),axis=(0,1))
+plt.figure()
+plt.imshow(np.abs(dir3_crop - sf_aligned[0,:,:]))
+
+freq, frc, n_per_ring = fourier_ring_correlation(np.angle(dir3_crop), np.angle(sf_aligned[0,:,:]),
+                                                    pixel_size_m=sf_pixel_size[label])
+curves.append(frc), labels.append(label), pixel_sizes.append(sf_pixel_size[label])
+
+i, (label, sf_object) = next(item_iterator)
+print(f"  {i}) dir3 vs {label}:")
+sf_aligned[1,:,:] = np.roll(sf_object,(1,3),axis=(0,1))
+freq, frc, n_per_ring = fourier_ring_correlation(np.angle(dir3_crop), np.angle(sf_aligned[1,:,:]),
+                                                    pixel_size_m=sf_pixel_size[label])
+curves.append(frc), labels.append(label), pixel_sizes.append(sf_pixel_size[label])
+
+i, (label, sf_object) = next(item_iterator)
+print(f"  {i}) dir3 vs {label}:")
+sf_aligned[2,:,:] = np.roll(sf_object,(1,1),axis=(0,1))
+freq, frc, n_per_ring = fourier_ring_correlation(np.angle(dir3_crop), np.angle(sf_aligned[2,:,:]),
+                                                    pixel_size_m=sf_pixel_size[label])
+curves.append(frc), labels.append(label), pixel_sizes.append(sf_pixel_size[label])
+
+
+# plt.figure()
+# plt.imshow(np.abs(dir3_crop - sf_aligned[0,:,:]))
+
 
 print(f"  {len(curves) + 1}) dir1+dir4 vs dir2+dir3 (step-scan resolution ceiling):")
-_, group2_aligned, _ = align_pair(group1, group2)
-_, frc_step, _ = fourier_ring_correlation(np.angle(group1), np.angle(group2_aligned),
+group2_aligned= np.roll(group2, (-1,-1),axis=(0,1))
+# plt.figure()
+# plt.imshow(np.abs(group1 - group2_aligned))
+_,frc_step,_ = fourier_ring_correlation(np.angle(group1), np.angle(group2_aligned),
                                           pixel_size_m=step_pixel_size_m)
 curves.append(frc_step), labels.append("Step-scan"), pixel_sizes.append(step_pixel_size_m)
 colors = singleframe_colors + [step_scan_color]
@@ -219,9 +230,9 @@ colors = singleframe_colors + [step_scan_color]
 half_bit = frc_half_bit_threshold(n_per_ring)   # same crop size for all -> same n_per_ring
 
 # Paper figure: single-column width, type sized for print at that width.
-paper_rc = {"font.size": 8, "axes.labelsize": 9, "xtick.labelsize": 8, "ytick.labelsize": 8,
-            "legend.fontsize": 7.5, "lines.linewidth": 1.3}
-def paper_frc_figure(keep, legend_kwargs, figsize=(3.4, 2.7)):
+paper_rc = {"font.size": 9, "axes.labelsize": 10, "xtick.labelsize": 9, "ytick.labelsize": 9,
+            "legend.fontsize": 8.5, "lines.linewidth": 1.8, "figure.dpi": 300}
+def paper_frc_figure(keep, legend_kwargs, figsize=(3.5, 3.0)): #figsize=(3.4, 2.7)
     """One paper FRC figure with only the curves whose label is in `keep`; each run keeps
     its color across figures."""
     idx = [labels.index(k) for k in keep]
@@ -229,7 +240,7 @@ def paper_frc_figure(keep, legend_kwargs, figsize=(3.4, 2.7)):
         fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
         plot_frc(
             freq, [curves[i] for i in idx], threshold=half_bit, labels=[labels[i] for i in idx],
-            ax=ax, colors=[colors[i] for i in idx], resolution_in_label=True,
+            ax=ax, colors=[colors[i] for i in idx], resolution_in_label=False,
             top_tick_spacing=0.11, legend_kwargs=legend_kwargs,
         )
         plt.xlim(0,20)
@@ -245,16 +256,17 @@ print("FRC half-bit crossings, figure 2 (step-scan vs. band-limit relax):")
 # Legend below the axes: inside, it runs into the step-scan curve.
 legend_below = {"frameon": False, "fontsize": 7.5, "loc": "upper center", "bbox_to_anchor": (0.5, -0.2),
                 "ncol": 2, "columnspacing": 1.0, "handlelength": 1.6}
-paper_frc_figure(["Band-limit relax", "Step-scan"], legend_below, figsize=(3.4, 3.0))
+# paper_frc_figure(["Band-limit relax", "Step-scan"], legend_below, figsize=(3.4, 3.0))
+paper_frc_figure(["Band-limit relax", "Step-scan"], legend_inside, figsize=(3.4, 3.0))
 
 #%% FRC rings: where each curve's resolution cutoff sits in Fourier space, on group 1's
 # own power spectrum (group 1 is the common image in every curve above).
-# radii = [frc_crossing_px(freq, frc, half_bit, group1.shape, px)
-#          for frc, px in zip(curves, pixel_sizes)]
-# plot_frc_rings(
-#     np.angle(group1), radii, labels=labels, colors=colors,
-#     log_floor=1e-10, title=f"FRC rings at frame {frame_index}'s lit area (dir1+dir4 power spectrum)",
-# )
+radii = [frc_crossing_px(freq, frc, half_bit, group1.shape, px)
+         for frc, px in zip(curves, pixel_sizes)]
+plot_frc_rings(
+    np.angle(group1), radii, labels=labels, colors=colors,
+    log_floor=1e-10, title=f"FRC rings at frame {frame_index}'s lit area (dir1+dir4 power spectrum)",
+)
 # plt.show()
 
 #%% plot the reonstruction strategy with loss functions
@@ -286,7 +298,9 @@ for label, path in singleframe_recons.items():
         n_obj_final = f["object_lowres"].shape[-1]
     probe_key = (params["path_to_init_recon"], params["n_probe_modes"])
     if probe_key not in init_probes:
-        with h5py.File(probe_key[0], "r") as f:
+        # rpi_params.json was written on Linux: map /mnt/micdataN/... onto the \\micdata\dataN share
+        init_recon = Path(probe_key[0].replace("/mnt/micdata", r"\\micdata\data", 1))
+        with h5py.File(init_recon, "r") as f:
             init_probes[probe_key] = torch.as_tensor(f["probe"][0, :probe_key[1]])
     kp = probe_fourier_radius(init_probes[probe_key], params["rpi_kp_quantile"])
     if params["rpi_relaxation_freq"]:
@@ -370,32 +384,87 @@ for scale in ("sqrt", "ln"):
     plot_strategy_dual(scale)
 
 #%% only plot the loss curve of the band-limit relax run, with the RPI relaxation schedule overlaid
-def plot_run_strategy(label, scale="sqrt"):
-    """One run alone: loss (solid, left axis) with its band-limit ratio R (dashed, right
-    axis) overlaid. A run with no band limit has no R, so it gets the loss only.
-    `scale` is "sqrt" or "ln" for the iteration axis."""
-    run = strategy[label]
-    color = singleframe_colors[list(singleframe_recons).index(label)]
-    iterations = np.arange(1, len(run["loss"]) + 1)
-    print(f"loss figure: {label}, {scale} iteration axis")
+# def plot_run_strategy(label, scale="sqrt"):
+#     """One run alone: loss (solid, left axis) with its band-limit ratio R (dashed, right
+#     axis) overlaid. A run with no band limit has no R, so it gets the loss only.
+#     `scale` is "sqrt" or "ln" for the iteration axis."""
+#     run = strategy[label]
+#     color = singleframe_colors[list(singleframe_recons).index(label)]
+#     iterations = np.arange(1, len(run["loss"]) + 1)
+#     print(f"loss figure: {label}, {scale} iteration axis")
+#     with plt.rc_context(paper_rc):
+#         fig, ax_loss = plt.subplots(figsize=(4.4, 2.6), constrained_layout=True)
+#         line_loss, = ax_loss.semilogy(iterations, run["loss"], color=color, label="Loss")
+#         ax_loss.set_ylabel("Loss")
+#         set_iteration_axis(ax_loss, scale)
+#         if run["ratio"] is not None:
+#             ax_ratio = ax_loss.twinx()
+#             line_ratio, = ax_ratio.plot(iterations, run["ratio"], color="#52514e", ls="--",
+#                                         drawstyle="steps-post", label=ratio_label)
+#             ax_ratio.set_ylabel(ratio_label)
+#             ax_ratio.set_ylim(0.3, 1.0)
+#             ax_loss.legend(handles=[line_loss, line_ratio], frameon=False, loc="center right")
+#         plt.show()
+
+
+# plot_run_strategy("Band-limit relax")
+
+#%% phase line cuts: phase (rad) vs distance (nm) along one line through the lit area
+# On dir3_crop's grid: every sf_aligned[k] was rolled onto it in the FRC section, so the
+# same pixel coordinates pick out the same feature in every image.
+cut_start_xy, cut_end_xy = (260, 173), (272, 207)   # (x, y) = (col, row), as imshow's cursor reads
+cut_src_rc, cut_dst_rc = cut_start_xy[::-1], cut_end_xy[::-1]   # profile_line takes (row, col)
+cut_length_px = np.hypot(cut_dst_rc[0] - cut_src_rc[0], cut_dst_rc[1] - cut_src_rc[1])
+
+
+def phase_line_cut(img, pixel_size_m):
+    """(distance_nm, phase_rad) from cut_start_xy to cut_end_xy, bilinear-interpolated;
+    distance is measured from the start point."""
+    phase = profile_line(np.angle(img), cut_src_rc, cut_dst_rc, order=1)
+    distance_nm = np.linspace(0, cut_length_px * pixel_size_m * 1e9, len(phase))
+    return distance_nm, phase
+
+
+line_cuts = {"Step-scan": (dir3_crop, dir3_pixel_size_m, step_scan_color)}   # label -> (image, pixel size, color)
+for k, label in enumerate(singleframe_recons):
+    line_cuts[label] = (sf_aligned[k], sf_pixel_size[label], singleframe_colors[k])
+print(f"line cut {cut_start_xy} -> {cut_end_xy} (x, y): {cut_length_px:.1f} px = "
+      f"{cut_length_px * dir3_pixel_size_m * 1e9:.1f} nm at dir3's pixel; pixel sizes "
+      + ", ".join(f"{label} {px * 1e9:.4f} nm" for label, (_, px, _) in line_cuts.items()))
+
+# where the cut runs, on dir3's phase; the dot marks x = 0
+with plt.rc_context(paper_rc):
+    fig, ax = plt.subplots(figsize=(3.4, 3.4), constrained_layout=True)
+    ax.imshow(np.angle(dir3_crop), cmap="gray")
+    ax.plot([cut_start_xy[0], cut_end_xy[0]], [cut_start_xy[1], cut_end_xy[1]], color=step_scan_color)
+    # ax.plot(*cut_start_xy, "o", color=step_scan_color, markersize=3)
+    ax.set_xticks([]), ax.set_yticks([])
+    ax.set_title("Line cut on step-scan (dir3) phase")
+    plt.show()
+
+
+def paper_line_cut_figure(keep, legend_kwargs, figsize=(3.4, 2.7)):
+    """One paper line-cut figure with only the runs whose label is in `keep`; each run
+    keeps its FRC-figure color."""
     with plt.rc_context(paper_rc):
-        fig, ax_loss = plt.subplots(figsize=(4.4, 2.6), constrained_layout=True)
-        line_loss, = ax_loss.semilogy(iterations, run["loss"], color=color, label="Loss")
-        ax_loss.set_ylabel("Loss")
-        set_iteration_axis(ax_loss, scale)
-        if run["ratio"] is not None:
-            ax_ratio = ax_loss.twinx()
-            line_ratio, = ax_ratio.plot(iterations, run["ratio"], color="#52514e", ls="--",
-                                        drawstyle="steps-post", label=ratio_label)
-            ax_ratio.set_ylabel(ratio_label)
-            ax_ratio.set_ylim(0.3, 1.0)
-            ax_loss.legend(handles=[line_loss, line_ratio], frameon=False, loc="center right")
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+        for label in keep:
+            img, pixel_size_m, color = line_cuts[label]
+            ax.plot(*phase_line_cut(img, pixel_size_m), "o-",color=color, label=label)
+        ax.set_xlabel("x (nm)")
+        ax.set_ylabel("Phase (rad)")
+        ax.legend(**legend_kwargs)
         plt.show()
 
 
-plot_run_strategy("Band-limit relax")
+paper_line_cut_figure(["Band-limit relax", "Step-scan"], legend_inside)
+paper_line_cut_figure(list(singleframe_recons), legend_inside)
 
 # %%
-plot_run_strategy("No band limit")   # no band limit -> loss only
+# plot_run_strategy("No band limit")   # no band limit -> loss only
 plot_run_strategy("Band-limited")
 # %%
+
+sf_aligned[0,:,:] = np.roll(sf_object,(1,2),axis=(0,1))
+plt.figure()
+plt.imshow(np.abs(dir3_crop - sf_aligned[0,:,:]))
