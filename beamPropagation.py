@@ -32,7 +32,7 @@ the figure written to a PNG.
 # %% -- setup ---------------------------------------------------------------
 import os
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "5")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import json
 import re
@@ -95,14 +95,18 @@ from ptychi.propagate import AngularSpectrumPropagator, WavefieldPropagatorParam
 # ---------------------------------------------------------------------------
 # configuration
 # ---------------------------------------------------------------------------
-RECON_FILE = (
-    Path("/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/batch_JD/S0197")
-    / "Ndp128_LSQML_c500_m0.5_gaussian_p10_cp_pc500_f_ul2"
-    / "recon_Niter2000.h5"
-)
+# RECON_FILE = (
+#     Path("/mnt/micdata2/4IDD/2026_Sep/ptychi_recons/batch_JD/S0197")
+#     / "Ndp128_LSQML_c500_m0.5_gaussian_p10_cp_pc500_f_ul2"
+#     / "recon_Niter2000.h5"
+# )
 
-Z_RANGE_UM = (-200.0, 700.0)  # propagation distances to scan (focus sits near +475 um)
-N_Z = 91                      # number of planes
+RECON_FILE = (Path(r"\\micdata\data3\fengling\date_Laserlab")
+            / "ptychi_recons/20261107_s1805_8mmzp_2ms_area2"
+            / "Ndp256_LSQML_c50_m0.25_gaussian_p1_opr1_pc0"/"recon_Niter1000.h5")
+
+Z_RANGE_UM = (-2000.0, 2000.0)  # propagation distances to scan (focus sits near +475 um)
+N_Z = 50                      # number of planes
 PAD = 2                       # zero-pad factor before propagating (avoids wrap-around)
 MODES = "all"                 # probe modes to add incoherently; "all", or a list like [0, 1, 2]
 DISPLAY = "intensity"         # "intensity" sums all MODES; "complex"/"amplitude"/"phase" show MODES[0]

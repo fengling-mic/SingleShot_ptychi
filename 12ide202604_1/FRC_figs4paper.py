@@ -412,7 +412,7 @@ for scale in ("sqrt", "ln"):
 #%% phase line cuts: phase (rad) vs distance (nm) along one line through the lit area
 # On dir3_crop's grid: every sf_aligned[k] was rolled onto it in the FRC section, so the
 # same pixel coordinates pick out the same feature in every image.
-cut_start_xy, cut_end_xy = (260, 173), (272, 207)   # (x, y) = (col, row), as imshow's cursor reads
+cut_start_xy, cut_end_xy = (257, 164), (268, 192)   # (x, y) = (col, row), as imshow's cursor reads
 cut_src_rc, cut_dst_rc = cut_start_xy[::-1], cut_end_xy[::-1]   # profile_line takes (row, col)
 cut_length_px = np.hypot(cut_dst_rc[0] - cut_src_rc[0], cut_dst_rc[1] - cut_src_rc[1])
 
@@ -449,13 +449,18 @@ def paper_line_cut_figure(keep, legend_kwargs, figsize=(3.4, 2.7)):
     with plt.rc_context(paper_rc):
         fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
         for label in keep:
-            img, pixel_size_m, color = line_cuts[label]
-            ax.plot(*phase_line_cut(img, pixel_size_m), "o-",color=color, label=label)
+            if label == 'Step-scan':
+                img, pixel_size_m, color = line_cuts[label]
+                ax.plot(*phase_line_cut(img, pixel_size_m), ".-",color=color, label=label)
+            else:
+                img, pixel_size_m, color = line_cuts[label]
+                ax.plot(*phase_line_cut(img, pixel_size_m), ".--",color=color, label=label)
         ax.set_xlabel("x (nm)")
         ax.set_ylabel("Phase (rad)")
         ax.legend(**legend_kwargs)
         plt.show()
 
+paper_line_cut_figure(['Band-limited', 'Band-limit relax', 'No band limit', 'Step-scan'], legend_below)
 
 paper_line_cut_figure(["Band-limit relax", "Step-scan"], legend_inside)
 paper_line_cut_figure(list(singleframe_recons), legend_inside)
