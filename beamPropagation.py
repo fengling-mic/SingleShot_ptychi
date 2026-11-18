@@ -25,8 +25,9 @@ recon file.
 
 Runs top to bottom as a script, or cell by cell (``#%%``) in VS Code. The
 backend is chosen automatically: ipympl in a notebook kernel (works over plain
-SSH, no X server), TkAgg when a desktop session is present, otherwise Agg with
-the figure written to a PNG.
+SSH, no X server), TkAgg when a desktop session is present (always on Windows
+and macOS; DISPLAY/WAYLAND_DISPLAY on Linux), otherwise Agg with the figure
+written to a PNG.
 """
 
 # %% -- setup ---------------------------------------------------------------
@@ -36,6 +37,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import json
 import re
+import sys
 from pathlib import Path
 
 import h5py
@@ -49,13 +51,19 @@ def select_backend():
 
     Hard-coding TkAgg fails over plain SSH with "Cannot load backend 'TkAgg'
     ... as 'headless' is currently running", because Tk needs an X display and
-    there is none. The three cases that matter here:
+    there is none. The cases that matter here:
 
     * VS Code interactive window / Jupyter kernel -> ipympl, which draws into
       the notebook and needs no X server. This is the SSH-friendly one.
-    * A real desktop session (DISPLAY or WAYLAND_DISPLAY set) -> TkAgg.
+    * A kernel without ipympl on a desktop -> %matplotlib tk: a separate Tk
+      window, with IPython running its event loop so the slider stays live.
+    * A plain script on a desktop -> TkAgg. Windows and macOS always have one;
+      on Linux it takes DISPLAY or WAYLAND_DISPLAY, which Windows never sets.
     * Neither -> Agg, and the figure gets written to a PNG instead of shown.
     """
+    has_desktop = sys.platform in ("win32", "darwin") or bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
     try:
         from IPython import get_ipython
 
@@ -67,13 +75,18 @@ def select_backend():
         try:
             import ipympl  # noqa: F401
         except ImportError:
+            if has_desktop:
+                print("Running in a kernel without ipympl -- opening the figure in a separate\n"
+                      "  window. For an inline figure:  pip install ipympl   (then restart the kernel)")
+                shell.run_line_magic("matplotlib", "tk")
+                return matplotlib.get_backend(), True
             print("Running in a kernel but ipympl is missing -- the slider will be dead.\n"
                   "  Fix with:  pip install ipympl   (then restart the kernel)")
         else:
             shell.run_line_magic("matplotlib", "widget")
             return matplotlib.get_backend(), True
 
-    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    if has_desktop:
         matplotlib.use("TkAgg")
         return "TkAgg", True
 
@@ -102,8 +115,8 @@ from ptychi.propagate import AngularSpectrumPropagator, WavefieldPropagatorParam
 # )
 
 RECON_FILE = (Path(r"\\micdata\data3\fengling\date_Laserlab")
-            / "ptychi_recons/20261107_s1805_8mmzp_2ms_area2"
-            / "Ndp256_LSQML_c50_m0.25_gaussian_p1_opr1_pc0"/"recon_Niter1000.h5")
+            / "ptychi_recons/20261113_FoV4mm_500umstp_s1805_8mmzp_2ms"
+            / "Ndp512_LSQML_c50_m0.25_gaussian_p1_opr1_pc0"/"recon_Niter1000.h5")
 
 Z_RANGE_UM = (-2000.0, 2000.0)  # propagation distances to scan (focus sits near +475 um)
 N_Z = 50                      # number of planes
@@ -458,7 +471,7 @@ if INTERACTIVE:
 else:
     png = RECON_FILE.parent / "beam_propagation.png"
     show_plane(i_focus)
-    fig.savefig(png, dpi=110)
+    # fig.savefig(png, dpi=110)
     print(f"Wrote {png}")
 
 

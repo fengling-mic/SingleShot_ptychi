@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from matplotlib.colors import hsv_to_rgb
 
 try:
     import tifffile
@@ -320,6 +321,7 @@ def make_probe(
     edge_softness=0.1,
     defocus_m=0.0,
     astigmatism_m=0.0,
+    curvature_m=None,
     vortex_charge=0,
     shift_px=(0.0, 0.0),
     random_phase_rad=0.0,
@@ -357,6 +359,12 @@ def make_probe(
         Sample distance downstream of the focus (angular spectrum, exact).
     astigmatism_m
         Difference in focus between x and y; splits `defocus_m` by +-a/2.
+    curvature_m
+        Wavefront radius R: multiplies the aperture by
+        exp(i 2 pi/lambda (x^2 + y^2) / (2 R)) on the plane it is drawn on
+        (fracPy's quadratic probe phase). None = flat; the sign flips the
+        curvature. Unlike `defocus_m` this does not propagate, so the aperture
+        keeps its clean shape (an ideal thin-lens wavefront).
     vortex_charge
         Topological charge l: multiplies the aperture by exp(i l theta). That
         is the phase plate, so the dark core only opens up after focusing
@@ -409,9 +417,10 @@ def make_probe(
 
     if plane not in ("sample", "pupil"):
         raise ValueError(f"plane must be 'sample' or 'pupil', not {plane!r}")
-    needs_lambda = plane == "pupil" or defocus_m or astigmatism_m
+    needs_lambda = plane == "pupil" or defocus_m or astigmatism_m or curvature_m
     if needs_lambda and (in_pixels or wavelength_m is None):
-        raise ValueError("pupil-plane construction and defocus need pixel_size_m and wavelength_m")
+        raise ValueError("pupil-plane construction, defocus and curvature need pixel_size_m "
+                         "and wavelength_m")
 
     # ---- grain: a kernel sigma in pixels, or a wanted grain in metres ------
     if speckle_grain_px is not None and speckle_grain_m is not None:
@@ -457,6 +466,9 @@ def make_probe(
     if speckle:
         field = field * _speckle_modulation(size, speckle, speckle_grain_px, rng,
                                             speckle_phase_only)
+
+    if curvature_m:
+        field = field * np.exp(1j * 2 * np.pi / wavelength_m * (X**2 + Y**2) / (2 * curvature_m))
 
     # ---- angular spectrum: defocus, astigmatism, translation --------------
     spectrum = field if plane == "pupil" else _ft(field)
@@ -512,6 +524,8 @@ def make_probe(
             msg.append(f"  defocus {defocus_m * 1e6:+.1f} um, astigmatism "
                        f"{astigmatism_m * 1e6:+.1f} um (angular-spectrum limit "
                        f"|z| < {z_crit * 1e6:.0f} um)")
+        if curvature_m:
+            msg.append(f"  wavefront curvature R = {curvature_m:+.4g} m")
         if speckle:
             where = "pupil" if plane == "pupil" else "sample"
             msg.append(f"  speckle {'phase ' if speckle_phase_only else ''}{speckle:.2f}, "
@@ -523,7 +537,7 @@ def make_probe(
             # Both diagnostics only make sense where the probe is still on the
             # plane the grains were drawn on. Focus or propagate and the grain
             # is reset by the aperture size, not by the kernel.
-            if plane == "sample" and not (defocus_m or astigmatism_m):
+            if plane == "sample" and not (defocus_m or astigmatism_m or curvature_m):
                 # The delivered grain: FWHM of the field autocorrelation. This
                 # is the speckle you see, and once the phase wraps it is much
                 # finer than the screen printed above.
@@ -1320,6 +1334,64 @@ def show_probe(probe, pixel_size_m=None, mode=0, opr=0, cmap="inferno",
     plt.show()
 
 
+_LENGTH_UNITS = {"nm": 1e9, "um": 1e6, "mm": 1e3}
+
+
+def centered_extent(shape, pixel_size_m, unit="um"):
+    """imshow extent [x0, x1, y1, y0] of an array centred on its middle pixel, in `unit`
+    ("nm", "um" or "mm") -- the same centring as show_probe and Pty-Chi's object origin."""
+    if unit not in _LENGTH_UNITS:
+        raise ValueError(f"unit must be one of {list(_LENGTH_UNITS)}, not {unit!r}")
+    step = pixel_size_m * _LENGTH_UNITS[unit]
+    cy = (np.arange(shape[-2]) - shape[-2] // 2) * step
+    cx = (np.arange(shape[-1]) - shape[-1] // 2) * step
+    return [cx[0], cx[-1], cy[-1], cy[0]]
+
+
+def plot_complex(field, ax=None, mode=0, opr=0, brightness="intensity", pixel_size_m=None,
+                 unit="um", title=None, colorbar=True):
+    """Draw a complex field as one image: hue = phase, brightness = intensity (or amplitude).
+
+    `field` is a 2D complex array or tensor; a probe stack (n_modes, h, w) or
+    (n_opr, n_modes, h, w) is reduced to `mode` / `opr` as in show_probe.
+    `brightness` is "intensity" (|psi|^2, the default) or "amplitude" (|psi|, which
+    shows weak regions more), normalised to the maximum. Extents are in `unit` ("nm",
+    "um" or "mm") when `pixel_size_m` is given, else px. The colour bar is the phase, -pi..pi on
+    matplotlib's "hsv" map -- the same hue sweep as the image. Draws into `ax` (a new
+    figure if None) and returns the axes; showing the figure is left to the caller.
+    """
+    psi = field.detach().cpu().numpy() if torch.is_tensor(field) else np.asarray(field)
+    if psi.ndim == 4:
+        psi = psi[opr, mode]
+    elif psi.ndim == 3:
+        psi = psi[mode]
+    if brightness not in ("intensity", "amplitude"):
+        raise ValueError(f'brightness must be "intensity" or "amplitude", not {brightness!r}')
+
+    value = np.abs(psi) ** (2 if brightness == "intensity" else 1)
+    value = value / max(value.max(), 1e-300)
+    hue = (np.angle(psi) + np.pi) / (2 * np.pi)
+    rgb = hsv_to_rgb(np.stack([hue, np.ones_like(value), value], axis=-1))
+
+    extent = None if pixel_size_m is None else centered_extent(psi.shape, pixel_size_m, unit)
+    axis_unit = "px" if pixel_size_m is None else unit
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(5.5, 4.5))
+    ax.imshow(rgb, extent=extent)
+    ax.set_aspect("equal")
+    ax.set_xlabel(f"x [{axis_unit}]"), ax.set_ylabel(f"y [{axis_unit}]")
+    if colorbar:
+        cb = ax.figure.colorbar(
+            plt.cm.ScalarMappable(cmap="hsv", norm=plt.Normalize(-np.pi, np.pi)),
+            ax=ax, fraction=0.046, pad=0.02, label="phase [rad]",
+        )
+        cb.set_ticks([-np.pi, 0, np.pi], labels=["-π", "0", "π"])
+    ax.set_title(f"hue = phase, brightness = {brightness}" if title is None else title,
+                 fontsize=10)
+    return ax
+
+
 def siemens_star(shape, n_spokes=24):
     yy, xx = np.mgrid[: shape[0], : shape[1]]
     theta = np.arctan2(yy - shape[0] / 2, xx - shape[1] / 2)
@@ -1446,6 +1518,17 @@ def rpi_diffraction_loss(predicted_intensity, measured_intensity, mask):
     """Normalized amplitude MSE (Eq. 2), over valid detector pixels only."""
     resid = (predicted_intensity.sqrt() - measured_intensity.sqrt()) ** 2
     return (resid * mask).sum() / (measured_intensity * mask).sum()
+
+
+def total_variation(obj, eps=1e-8):
+    """Isotropic total variation of a complex 2D object, mean over pixels:
+    mean(sqrt(|dO/dx|^2 + |dO/dy|^2 + eps)), forward differences. Penalizes pixel-to-pixel
+    wiggle (noise) much more than a few sharp edges, so it favors piecewise-flat objects.
+    |.|^2 is written as real^2 + imag^2: autograd through abs() of a complex zero gives NaN,
+    and a strongly regularized object does reach exactly-equal neighbors."""
+    dx = obj[..., :-1, 1:] - obj[..., :-1, :-1]
+    dy = obj[..., 1:, :-1] - obj[..., :-1, :-1]
+    return torch.sqrt(dx.real ** 2 + dx.imag ** 2 + dy.real ** 2 + dy.imag ** 2 + eps).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -2201,7 +2284,8 @@ def make_rpi_recon_dir_name(cfg=None, suffix="", **knobs):
     (the object grid actually used), R<rpi_resolution_ratio> (the configured
     ratio, omitted when the caller doesn't define one),
     relax<rpi_relaxation_freq>_<rpi_relax_start>-<rpi_relax_end> (only when
-    band-limit relaxation is enabled), p<n_probe_modes>, opr<n_opr_modes>,
+    band-limit relaxation is enabled), tv<rpi_tv_weight> (only when total-variation
+    regularization is on), p<n_probe_modes>, opr<n_opr_modes>,
     and either "pf" (probe held fixed throughout) or "prel<rpi_probe_start>"
     (released at that epoch).
 
@@ -2237,6 +2321,9 @@ def make_rpi_recon_dir_name(cfg=None, suffix="", **knobs):
         relax_start = k("rpi_relax_start", 0)
         relax_end = k("rpi_relax_end", k("num_epochs", ""))
         parts.append(f"relax{relax_freq}_{relax_start}-{relax_end}")
+    tv_weight = k("rpi_tv_weight", 0.0)
+    if tv_weight:
+        parts.append(f"tv{tv_weight:g}")
     parts += [
         f"p{k('n_probe_modes')}",
         f"opr{k('n_opr_modes', 1)}",
@@ -2339,6 +2426,7 @@ def collect_rpi_params(cfg=None, **overrides):
         "rpi_relaxation_freq": k("rpi_relaxation_freq", None),
         "rpi_relax_start": k("rpi_relax_start", None),
         "rpi_relax_end": k("rpi_relax_end", None),
+        "rpi_tv_weight": k("rpi_tv_weight", 0.0),
         "num_epochs": k("num_epochs"),
         "optimizer": k("rpi_optimizer_cls").__name__,
         "rpi_lr": k("rpi_lr"),

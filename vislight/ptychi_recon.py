@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from scipy.ndimage import median_filter
 
-from utils import center_crop_or_pad, show_ptychogram, make_probe, hermite_secondary_modes
+from utils import (center_crop_or_pad, show_ptychogram, make_probe, hermite_secondary_modes,
+                   plot_complex, centered_extent)
 
 import ptychi.api as api
 from ptychi.api.options.base import OptimizationPlan
@@ -36,17 +37,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 #%% ---------------------------------------------------------------- paths
 
-scan = "20261107_s1805_8mmzp_2ms_area2"
+scan = "20261114_FoV3mm_500umstp_1000mmlens_structure_2ms"
 
 # On Linux the same share is /mnt/micdata3; here on Windows it is \\micdata\data3.
 data_root = Path(r"\\micdata\data3\fengling\date_Laserlab")
 # data_root = Path("/mnt/micdata3/fengling/date_Laserlab")
 
-dp_file = data_root / "preproc" / scan / "data_roi0_Ndp256_dp.h5"
-para_file = data_root / "preproc" / scan / "data_roi0_Ndp256_para.h5"
+dp_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_dp.h5"
+para_file = data_root / "preproc" / scan / "data_roi0_Ndp1024_para.h5"
 
 out_dir = data_root / "ptychi_recons"
-recon_dir_suffix = ""            # appended to the folder name, e.g. "_v2" or "_pos"
+recon_dir_suffix = "_probeReal"            # appended to the folder name, e.g. "_v2" or "_pos"
 
 #%% ---------------------------------------------------------------- read the parameters from the file
 
@@ -69,7 +70,7 @@ print(f"lambda {wavelength_m * 1e9:.1f} nm, distance {detector_distance_m * 1e3:
 
 #%% ---------------------------------------------------------------- geometry & knobs
 
-n_dp = 256                          # detector crop (the preprocessed frames are 256 x 256)
+n_dp = 512                          # detector crop (the preprocessed frames are 256 x 256)
 # The sample sits at the front focal plane of a Fourier lens and the camera at the
 # back one, so the camera records the exact Fourier transform of the exit wave: far
 # field, with the lens focal length in place of the detector distance.
@@ -97,16 +98,17 @@ n_probe_modes = 1                # mixed-state modes
 n_opr_modes = 1                  # variable probe (OPR); 1 disables it
 
 # Initial probe: make_probe + Gerchberg-Saxton against the data (initial-probe cell).
-probe_init_type = "disk"         # "disk" or "gaussian"
+probe_init_type = "gaussian"         # "disk" or "gaussian"
 # Beam size on the sample. 20261107_s1805_8mmzp_2ms_area2: the autocorrelation of the
 # mean pattern falls to 10% at r ~ 2.6 mm, a disk of ~3 mm -- fracPy's
 # entrancePupilDiameter for this scan. (20261110_5ti30au_zp_2ms: ~1.5 mm.)
 probe_diameter_m = 3e-3
-probe_speckle = 0.0              # a laser beam has no diffuser; > 0 mottles the disk
+probe_curvature_m = 1000e-3      # wavefront radius of the initial probe; None = flat
+probe_speckle = 0.0             # a laser beam has no diffuser; > 0 mottles the disk
 probe_speckle_grain_m = None     # delivered grain [m], only used with probe_speckle > 0
 probe_speckle_phase_only = False
 probe_speckle_seed = 0           # change for a different realization
-gs_iterations = 200              # GS iterations fitting the probe's far field to the data; 0 keeps the plain disk
+gs_iterations = 100              # GS iterations fitting the probe's far field to the data; 0 keeps the plain disk
 
 object_padding_px = 100          # extra object buffer around the scan bounding box
 
@@ -117,7 +119,7 @@ batching_mode = api.BatchingModes.COMPACT
 noise_model = api.NoiseModels.GAUSSIAN  # camera ADU, not photon counts
 momentum_gain = 0.25
 
-probe_start = 100                  # epoch at which the probe starts updating
+probe_start = 80                  # epoch at which the probe starts updating
 opr_start = None                  # None disables OPR weight optimization
 position_start = None             # None disables position correction
 orthogonalization_stride = 5
@@ -273,6 +275,7 @@ plt.show()
 
 probe_init = make_probe(
     n_dp, probe_init_type, diameter=probe_diameter_m, pixel_size_m=pixel_size_m,
+    wavelength_m=wavelength_m, curvature_m=probe_curvature_m,
     speckle=probe_speckle, speckle_grain_m=probe_speckle_grain_m,
     speckle_phase_only=probe_speckle_phase_only, seed=probe_speckle_seed,
     verbose=True,
@@ -296,6 +299,17 @@ probe_init = make_probe(
 # GS converges to some field consistent with both amplitudes, not to the beam's
 # actual phase, which only a reconstruction recovers.
 _pct10 = np.percentile(patterns, 10, axis=0)
+# The low percentile only finds the beam when it sits on the same pixels in (nearly)
+# every frame. When the bright spot moves between frames (20261113_150mmLens: no pixel
+# lit in more than 85% of frames) the 10th percentile is empty, and GS against it would
+# drive the probe to zero -- rescale_probe then turns that into NaN.
+_mean_pattern = patterns.mean(axis=0)
+_beam_ok = _pct10[valid_pixel_mask].sum() > 1e-2 * _mean_pattern[valid_pixel_mask].sum()
+if not _beam_ok and gs_iterations:
+    print("WARNING: the 10th-percentile pattern carries <1% of the counts -- the bright spot "
+          "moves between frames, so there is no common beam far field to fit. GS skipped; "
+          "the probe stays the plain disk.")
+_gs_done = gs_iterations if _beam_ok else 0
 _ff_amp = np.sqrt(np.fft.ifftshift(_pct10))
 _measured = np.fft.ifftshift(valid_pixel_mask)   # no measurement at dead pixels
 _p = np.asarray(probe_init, dtype=np.complex64)
@@ -303,7 +317,7 @@ _flat = _p.reshape(-1, n_dp, n_dp)
 for _i in range(_flat.shape[0]):
     _mode = _flat[_i]
     _envelope = np.abs(_mode) > 0.01 * np.abs(_mode).max()
-    for _ in range(gs_iterations):
+    for _ in range(_gs_done):
         _far = np.fft.fft2(_mode)
         _far = np.where(_measured, _ff_amp * np.exp(1j * np.angle(_far)), _far)
         _mode = np.fft.ifft2(_far) * _envelope
@@ -312,24 +326,28 @@ probe_init = _flat.reshape(_p.shape)
 
 probe = torch.as_tensor(probe_init, dtype=get_default_complex_dtype())
 
-# Check: mode 0 in real space, and its far field next to the measured beam.
+# Check: mode 0 in real space, and its far field next to the measured beam (the mean
+# pattern when the 10th percentile is empty).
+_ff_ref = _pct10 if _beam_ok else _mean_pattern
+_ff_ref_name = "10th percentile" if _beam_ok else "mean pattern"
 _m0 = probe_init.reshape(-1, n_dp, n_dp)[0]
 _amp0 = np.abs(_m0)
 _far0 = np.fft.fftshift(np.abs(np.fft.fft2(_m0)) ** 2)
-_far0 *= _pct10[valid_pixel_mask].sum() / _far0[valid_pixel_mask].sum()
-_mismatch = np.linalg.norm((np.sqrt(_far0) - np.sqrt(_pct10))[valid_pixel_mask]) / np.linalg.norm(
-    np.sqrt(_pct10)[valid_pixel_mask]
+_far0 *= _ff_ref[valid_pixel_mask].sum() / _far0[valid_pixel_mask].sum()
+_mismatch = np.linalg.norm((np.sqrt(_far0) - np.sqrt(_ff_ref))[valid_pixel_mask]) / np.linalg.norm(
+    np.sqrt(_ff_ref)[valid_pixel_mask]
 )
 print(f"synthesized {probe_init_type} probe, diameter {probe_diameter_m * 1e3:.2f} mm, "
-      + (f"far field matched to the data in {gs_iterations} GS iterations " if gs_iterations
+      + (f"far field matched to the data in {_gs_done} GS iterations " if _gs_done
          else "plain disk, no GS fit ")
-      + f"(far-field amplitude mismatch to the data {_mismatch:.3f})")
+      + f"(far-field amplitude mismatch to the {_ff_ref_name} {_mismatch:.3f})")
 
 _ext = np.array([-0.5, 0.5, 0.5, -0.5]) * n_dp * pixel_size_m * 1e3
 _zoom_mm = 1.5 * probe_diameter_m * 1e3
 fig, axes = plt.subplots(1, 4, figsize=(16, 4))
 axes[0].imshow(_amp0, cmap="inferno", extent=_ext)
-axes[0].set_title(f"initial probe |mode 0| ({probe_init_type} + GS)", fontsize=9)
+axes[0].set_title(f"initial probe |mode 0| ({probe_init_type}{' + GS' if _gs_done else ''})",
+                  fontsize=9)
 axes[1].imshow(np.where(_amp0 > 0.05 * _amp0.max(), np.angle(_m0), np.nan),
                cmap="twilight", extent=_ext)
 axes[1].set_title("phase where |p| > 5% of max", fontsize=9)
@@ -337,9 +355,11 @@ for ax in axes[:2]:
     ax.set_xlim(-_zoom_mm, _zoom_mm)
     ax.set_ylim(_zoom_mm, -_zoom_mm)
     ax.set_xlabel("x [mm]"), ax.set_ylabel("y [mm]")
-_norm = LogNorm(vmin=max(float(_pct10[_pct10 > 0].min()), 1e-1), vmax=float(_pct10.max()))
-axes[2].imshow(np.where(valid_pixel_mask, _pct10, np.nan), cmap="inferno", norm=_norm)
-axes[2].set_title("measured beam far field (10th percentile)", fontsize=9)
+_pos = _ff_ref[_ff_ref > 0]
+_vmin = max(float(_pos.min()), 1e-1) if _pos.size else 1e-1
+_norm = LogNorm(vmin=_vmin, vmax=max(float(_ff_ref.max()), 10 * _vmin))
+axes[2].imshow(np.where(valid_pixel_mask, _ff_ref, np.nan), cmap="inferno", norm=_norm)
+axes[2].set_title(f"measured far field ({_ff_ref_name})", fontsize=9)
 axes[3].imshow(_far0, cmap="inferno", norm=_norm)
 axes[3].set_title("|FFT(mode 0)|^2", fontsize=9)
 for ax in axes[2:]:
@@ -444,7 +464,7 @@ options.object_options.fourier_support_constraint.optimization_plan = (
 # Absolute cutoff in FFT bins of the object buffer. Takes priority over the ratio
 # below; set it to None to fall back to the ratio. Note the object buffer is sized
 # per scan, so a fixed bin radius drifts in physical frequency between scans.
-options.object_options.fourier_support_constraint.radius_px = 100
+options.object_options.fourier_support_constraint.radius_px = 200
 # Used only when radius_px is None: ko / kp in cycles/m against the probe cutoff.
 options.object_options.fourier_support_constraint.radius_ratio_to_probe = 0.5
 
@@ -473,7 +493,7 @@ options.probe_options.support_constraint.fixed_probe_support_params = [
 ]
 
 # probe constrain in the Fourier space
-options.probe_options.fourier_support_constraint.enabled = True
+options.probe_options.fourier_support_constraint.enabled = False
 options.probe_options.fourier_support_constraint.optimization_plan = (
     OptimizationPlan(start=probe_start, stride=1)
 )
@@ -566,15 +586,15 @@ recon_probe = task.get_data_to_cpu("probe", as_numpy=True)[0]
 recon_pos = task.get_data_to_cpu("probe_positions", as_numpy=True)
 loss_table = task.reconstructor.loss_tracker.table
 
+_ext_obj = centered_extent(recon_obj.shape, pixel_size_m, unit="mm")
 fig, axes = plt.subplots(1, 3, figsize=(15, 7))
-axes[0].imshow(np.angle(recon_obj), cmap="gray")
+axes[0].imshow(np.angle(recon_obj), cmap="gray", extent=_ext_obj)
 axes[0].set_title("object phase")
-axes[1].imshow(np.abs(recon_obj), cmap="gray")
+axes[1].imshow(np.abs(recon_obj), cmap="gray", extent=_ext_obj)
 axes[1].set_title("object magnitude")
-axes[2].imshow(np.abs(recon_probe[0]), cmap="inferno")
-axes[2].set_title("probe mode 0")
-for ax in axes:
-    ax.set_xticks([]), ax.set_yticks([])
+plot_complex(recon_probe, ax=axes[2], mode=0, pixel_size_m=pixel_size_m, unit="mm", colorbar=True)
+for ax in axes[:2]:
+    ax.set_xlabel("x [mm]"), ax.set_ylabel("y [mm]")
 plt.tight_layout()
 plt.show()
 

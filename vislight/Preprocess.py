@@ -43,19 +43,19 @@ import tifffile
 ##########################################################################
 
 data_root  = Path(r"\\micdata\data3\fengling\date_Laserlab")  # /mnt/micdata3/fengling/date_Laserlab on Linux
-scan_name  = "20261107_s1805_8mmzp_2ms_area2"
-bg_name    = scan_name + "_bg"
+scan_name  = "20261113_FoV3mm_500umstp_zp_2ms_pos2"
+bg_name    = "20261113_FoV4mm_500umstp_50mmLens_2ms_bg"
 scan_dir   = data_root / scan_name
 bg_dir     = data_root / bg_name
 result_dir = data_root / "preproc" / scan_name
 
 wavelength      = 780e-9   # m
-dist            = 100e-3   # m, sample-detector distance
+dist            = 50e-3   # m, sample-detector distance
 det_pixel       = 5.5e-6   # m, camera pixel of the 256x256 frames
 exposure_time_s = 2e-3     # s, from the scan name "_2ms"
 
-cen_y, cen_x = 128, 128    # beam center (pix) on the raw 256x256 frame
-det_Npixel   = 256
+cen_y, cen_x = 512, 512    # beam center (pix) on the raw 256x256 frame
+det_Npixel   = 1024
 det_xwidth   = det_Npixel // 2
 dataName     = f"data_roi0_Ndp{det_Npixel:d}"
 
