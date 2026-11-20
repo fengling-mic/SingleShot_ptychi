@@ -340,7 +340,7 @@ def plot_strategy_stacked(scale):
     """Two stacked panels sharing the iteration axis: loss on top, R below."""
     with plt.rc_context(paper_rc):
         fig, (ax_loss, ax_ratio) = plt.subplots(
-            2, 1, figsize=(4.4, 3.0), sharex=True, constrained_layout=True,
+            2, 1, figsize=(4.4, 5.0), sharex=True, constrained_layout=True,
             gridspec_kw={"height_ratios": [2, 1]},
         )
         for (label, run), color in zip(strategy.items(), singleframe_colors):
@@ -380,8 +380,10 @@ def plot_strategy_dual(scale):
 for scale in ("sqrt", "ln"):
     print(f"strategy figure: stacked panels, {scale} iteration axis")
     plot_strategy_stacked(scale)
-    print(f"strategy figure: double y-axis, {scale} iteration axis")
-    plot_strategy_dual(scale)
+    # print(f"strategy figure: double y-axis, {scale} iteration axis")
+    # plot_strategy_dual(scale)
+
+plot_strategy_stacked(scale = "sqrt")
 
 #%% only plot the loss curve of the band-limit relax run, with the RPI relaxation schedule overlaid
 # def plot_run_strategy(label, scale="sqrt"):

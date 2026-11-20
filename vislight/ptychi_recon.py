@@ -116,12 +116,12 @@ num_epochs = 1000
 save_freq_iterations = 500       # write a recon_Niter*.h5 snapshot every N epochs
 batch_size = 50                  # the number of scan positions (196 in total)
 batching_mode = api.BatchingModes.COMPACT
-noise_model = api.NoiseModels.GAUSSIAN  # camera ADU, not photon counts
+noise_model = api.NoiseModels.POISSON  # camera ADU, not photon counts
 momentum_gain = 0.25
 
 probe_start = 80                  # epoch at which the probe starts updating
 opr_start = None                  # None disables OPR weight optimization
-position_start = None             # None disables position correction
+position_start = 800             # None disables position correction
 orthogonalization_stride = 5
 position_update_limit_px = 2.0    # per update; the scan step is ~5.4 px
 # Per-position beam intensity ("ic"). Pty-Chi applies the OPR weights in the forward
